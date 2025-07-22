@@ -62,6 +62,29 @@ def create_tables():
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Create agents table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agents (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                agent_id VARCHAR(255) NOT NULL,
+                agent_name VARCHAR(255) NOT NULL,
+                first_message TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                llm VARCHAR(255) NOT NULL,
+                documentation_id VARCHAR(255),
+                file_name VARCHAR(255),
+                file_url TEXT,
+                voice_id VARCHAR(255),
+                twilio_number VARCHAR(20) NOT NULL,
+                business_name VARCHAR(255),
+                agent_type VARCHAR(255),
+                speaking_style VARCHAR(255),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
         # Create trigger for updated_at
         cursor.execute("""
@@ -82,6 +105,21 @@ def create_tables():
                 ) THEN
                     CREATE TRIGGER update_users_updated_at
                         BEFORE UPDATE ON users
+                        FOR EACH ROW
+                        EXECUTE FUNCTION update_updated_at_column();
+                END IF;
+            END $$;
+        """)
+
+        # Add trigger for agents table
+        cursor.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger WHERE tgname = 'update_agents_updated_at'
+                ) THEN
+                    CREATE TRIGGER update_agents_updated_at
+                        BEFORE UPDATE ON agents
                         FOR EACH ROW
                         EXECUTE FUNCTION update_updated_at_column();
                 END IF;

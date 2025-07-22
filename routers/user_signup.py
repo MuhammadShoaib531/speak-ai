@@ -41,8 +41,12 @@ async def signup(user: UserCreate):
         company_name=user.company_name,
         hashed_password=hashed_password
     )
+    response = {
+        "message": "User created successfully",
+        "user": new_user
+    }
     
-    return new_user
+    return response
 
 @router.post("/login", response_model=Token)
 async def login(user_credentials: UserLogin):
@@ -60,7 +64,7 @@ async def login(user_credentials: UserLogin):
     access_token = create_access_token(
         data={"sub": user.email}, expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"email: user_credentials.email, access_token": access_token, "token_type": "bearer"}
 
 @router.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
