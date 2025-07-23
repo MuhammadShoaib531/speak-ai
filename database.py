@@ -63,8 +63,8 @@ def create_tables():
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # Add role column to existing users table if it doesn't exist
+        
+        # Migration: Add role column if it doesn't exist
         cursor.execute("""
             DO $$
             BEGIN
@@ -73,7 +73,6 @@ def create_tables():
                     WHERE table_name = 'users' AND column_name = 'role'
                 ) THEN
                     ALTER TABLE users ADD COLUMN role VARCHAR(50) DEFAULT 'Admin';
-                    UPDATE users SET role = 'Admin' WHERE role IS NULL;
                 END IF;
             END $$;
         """)

@@ -18,7 +18,6 @@ ALGORITHM = os.getenv("ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-# Use HTTPBearer for simple Bearer token authentication (no client_id/client_secret needed)
 security = HTTPBearer()
 
 def verify_password(plain_password, hashed_password):
@@ -79,7 +78,6 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     try:
         if not SECRET_KEY or not ALGORITHM:
             raise credentials_exception
-        # Extract token from credentials
         token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
