@@ -4,9 +4,12 @@ from twilio.base.exceptions import TwilioException
 import os
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 from auth import get_current_active_user
 from models import User
+from database import get_agents_by_user_id
 
 router = APIRouter(
     prefix="/analysis",
@@ -17,7 +20,7 @@ class PhoneNumberRequest(BaseModel):
     phone_number: str
 
 class MultiplePhoneNumbersRequest(BaseModel):
-    phone_numbers: list[str]
+    phone_numbers: Optional[list[str]] = None
     include_recent_calls: bool = True
     include_recent_messages: bool = True
 
@@ -52,18 +55,270 @@ def get_twilio_client():
     return Client(account_sid, auth_token)
 
 
+@router.post("/dashboard-analytics")
+async def get_dashboard_analytics(
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Get analytics data formatted for dashboard display.
+    Returns total calls, success rate, average duration, active agents count,
+    call patterns, weekly performance, and agent performance data.
+    """
+    try:
+        client = get_twilio_client()
+        
+        # Get user's agents from database
+        user_agents = get_agents_by_user_id(current_user.id)
+        if not user_agents:
+            raise HTTPException(
+                status_code=404,
+                detail="No agents found for current user"
+            )
+        
+        # Extract phone numbers and create agent mapping
+        phone_numbers = []
+        agent_phone_mapping = {}
+        
+        for agent in user_agents:
+            if agent.twilio_number:
+                phone_numbers.append(agent.twilio_number)
+                agent_phone_mapping[agent.twilio_number] = {
+                    "agent_type": agent.agent_type or "Unknown",
+                    "agent_name": agent.agent_name,
+                    "agent_id": agent.agent_id
+                }
+        
+        if not phone_numbers:
+            raise HTTPException(
+                status_code=404,
+                detail="No phone numbers found to analyze"
+            )
+        
+        # Initialize data structures
+        all_calls = []
+        agent_stats = {}
+        weekly_calls = {"Mon": 0, "Tue": 0, "Wed": 0, "Thu": 0, "Fri": 0, "Sat": 0, "Sun": 0}
+        hourly_calls = defaultdict(int)
+        hourly_successful_calls = defaultdict(int)
+        
+        # Get current date for weekly analysis (last 7 days)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        
+        # Process each phone number
+        for phone_number in phone_numbers:
+            try:
+                # Normalize phone number format
+                normalized_phone = phone_number
+                if not normalized_phone.startswith('+'):
+                    normalized_phone = '+' + normalized_phone
+                
+                # Get calls for this number (last 7 days)
+                outgoing_calls = client.calls.list(
+                    from_=normalized_phone,
+                    start_time_after=start_date,
+                    limit=1000
+                )
+                
+                incoming_calls = client.calls.list(
+                    to=normalized_phone,
+                    start_time_after=start_date,
+                    limit=1000
+                )
+                
+                phone_calls = list(outgoing_calls) + list(incoming_calls)
+                all_calls.extend(phone_calls)
+                
+                # Initialize agent stats
+                agent_info = agent_phone_mapping.get(phone_number, {})
+                agent_name = agent_info.get("agent_name", f"Agent {phone_number[-4:]}")
+                agent_type = agent_info.get("agent_type", "Unknown")
+                
+                agent_stats[phone_number] = {
+                    "agent_name": agent_name,
+                    "agent_type": agent_type,
+                    "total_calls": len(phone_calls),
+                    "successful_calls": 0,
+                    "total_duration": 0,
+                    "average_duration": 0,
+                    "success_rate": 0
+                }
+                
+                # Process calls for this agent
+                successful_calls = 0
+                total_duration = 0
+                
+                for call in phone_calls:
+                    # Weekly performance data
+                    if call.date_created:
+                        day_name = call.date_created.strftime("%a")
+                        weekly_calls[day_name] += 1
+                        
+                        # Hourly pattern data
+                        hour = call.date_created.hour
+                        hourly_calls[hour] += 1
+                        
+                        if call.status == 'completed':
+                            hourly_successful_calls[hour] += 1
+                    
+                    # Agent performance data
+                    if call.status == 'completed':
+                        successful_calls += 1
+                        if call.duration:
+                            total_duration += int(call.duration)
+                
+                # Update agent stats
+                agent_stats[phone_number]["successful_calls"] = successful_calls
+                agent_stats[phone_number]["total_duration"] = total_duration
+                agent_stats[phone_number]["success_rate"] = round(
+                    (successful_calls / len(phone_calls) * 100) if phone_calls else 0, 1
+                )
+                agent_stats[phone_number]["average_duration"] = round(
+                    (total_duration / successful_calls) if successful_calls > 0 else 0, 0
+                )
+                
+            except Exception as e:
+                print(f"Error processing phone number {phone_number}: {str(e)}")
+                continue
+        
+        # Calculate overall statistics
+        total_calls = len(all_calls)
+        successful_calls = len([c for c in all_calls if c.status == 'completed'])
+        total_duration = sum(int(c.duration) for c in all_calls if c.duration and c.status == 'completed')
+        
+        overall_success_rate = round((successful_calls / total_calls * 100) if total_calls > 0 else 0, 1)
+        average_call_duration = round((total_duration / successful_calls) if successful_calls > 0 else 0, 0)
+        active_agent_count = len([stats for stats in agent_stats.values() if stats["total_calls"] > 0])
+        
+        # Format call patterns data (hourly from 9 AM to 5 PM)
+        call_patterns = []
+        for hour in range(9, 18):  # 9 AM to 5 PM
+            hour_12 = hour if hour <= 12 else hour - 12
+            period = "AM" if hour < 12 else "PM"
+            if hour == 12:
+                period = "PM"
+            
+            time_label = f"{hour_12} {period}"
+            total_hour_calls = hourly_calls.get(hour, 0)
+            successful_hour_calls = hourly_successful_calls.get(hour, 0)
+            
+            call_patterns.append({
+                "time": time_label,
+                "total_calls": total_hour_calls,
+                "successful_calls": successful_hour_calls
+            })
+        
+        # Format weekly performance data
+        weekly_performance = [
+            {"day": "Mon", "calls": weekly_calls["Mon"]},
+            {"day": "Tue", "calls": weekly_calls["Tue"]},
+            {"day": "Wed", "calls": weekly_calls["Wed"]},
+            {"day": "Thu", "calls": weekly_calls["Thu"]},
+            {"day": "Fri", "calls": weekly_calls["Fri"]},
+            {"day": "Sat", "calls": weekly_calls["Sat"]},
+            {"day": "Sun", "calls": weekly_calls["Sun"]}
+        ]
+        
+        # Format agent performance data
+        agent_performance = []
+        for phone_number, stats in agent_stats.items():
+            if stats["total_calls"] > 0:  # Only include agents with calls
+                avg_minutes = int(stats["average_duration"]) // 60
+                avg_seconds = int(stats["average_duration"]) % 60
+                
+                agent_performance.append({
+                    "agent_name": stats["agent_name"],
+                    "agent_type": stats["agent_type"],
+                    "phone_number": phone_number,
+                    "total_calls": stats["total_calls"],
+                    "success_rate": f"{stats['success_rate']}%",
+                    "success_rate_value": stats["success_rate"],
+                    "average_duration": f"{avg_minutes}:{avg_seconds:02d} avg",
+                    "average_duration_seconds": stats["average_duration"]
+                })
+        
+        # Sort agents by total calls (descending)
+        agent_performance.sort(key=lambda x: x["total_calls"], reverse=True)
+        
+        # Get agent types summary
+        agent_types = {}
+        for agent in user_agents:
+            agent_type = agent.agent_type or "Unknown"
+            agent_types[agent_type] = agent_types.get(agent_type, 0) + 1
+        
+        return {
+            "overview": {
+                "total_calls": total_calls,
+                "success_rate": f"{overall_success_rate}%",
+                "success_rate_value": overall_success_rate,
+                "average_call_duration": f"{int(average_call_duration) // 60}:{int(average_call_duration) % 60:02d}",
+                "average_call_duration_seconds": average_call_duration,
+                "active_agent_count": active_agent_count
+            },
+            "call_patterns": call_patterns,
+            "weekly_performance": weekly_performance,
+            "agent_performance": agent_performance,
+            "agent_types": agent_types,
+            "data_period": {
+                "start_date": start_date.strftime("%Y-%m-%d"),
+                "end_date": end_date.strftime("%Y-%m-%d"),
+                "days": 7
+            }
+        }
+        
+    except TwilioException as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Twilio API error: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
 
 @router.post("/twilio-multiple-numbers-analytics")
 async def get_multiple_numbers_analytics(
-    request: MultiplePhoneNumbersRequest,
+    request: MultiplePhoneNumbersRequest = MultiplePhoneNumbersRequest(),
     current_user: User = Depends(get_current_active_user)
 ):
     """
     Get analytics for multiple phone numbers at once to save time.
+    If no phone numbers provided, automatically fetches user's assigned agent numbers.
     Returns individual analytics for each number plus combined summary.
     """
     try:
         client = get_twilio_client()
+        
+        # If no phone numbers provided, get them from user's agents
+        phone_numbers_to_process = request.phone_numbers
+        agent_phone_mapping = {}  # Map phone numbers to agent info
+        
+        if not phone_numbers_to_process:
+            # Get user's agents from database
+            user_agents = get_agents_by_user_id(current_user.id)
+            if not user_agents:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No agents found for current user"
+                )
+            
+            phone_numbers_to_process = []
+            for agent in user_agents:
+                if agent.twilio_number:
+                    phone_numbers_to_process.append(agent.twilio_number)
+                    agent_phone_mapping[agent.twilio_number] = {
+                        "agent_type": agent.agent_type,
+                        "agent_name": agent.agent_name,
+                        "agent_id": agent.agent_id
+                    }
+        
+        if not phone_numbers_to_process:
+            raise HTTPException(
+                status_code=404,
+                detail="No phone numbers found to analyze"
+            )
         
         results = []
         combined_stats = {
@@ -76,7 +331,7 @@ async def get_multiple_numbers_analytics(
             "all_messages": []
         }
         
-        for phone_number in request.phone_numbers:
+        for phone_number in phone_numbers_to_process:
             try:
                 # Normalize phone number format
                 normalized_phone = phone_number
@@ -155,6 +410,13 @@ async def get_multiple_numbers_analytics(
                     }
                 }
                 
+                # Add agent information if available
+                if phone_number in agent_phone_mapping:
+                    agent_info = agent_phone_mapping[phone_number]
+                    individual_result["agent_type"] = agent_info.get("agent_type")
+                    individual_result["agent_name"] = agent_info.get("agent_name")
+                    individual_result["agent_id"] = agent_info.get("agent_id")
+                
                 # Add recent calls and messages if requested
                 if request.include_recent_calls:
                     individual_result["recent_calls"] = [
@@ -193,13 +455,22 @@ async def get_multiple_numbers_analytics(
                 
             except Exception as e:
                 # If one number fails, include error but continue with others
-                results.append({
+                error_result = {
                     "phone_number": phone_number,
                     "status": "error",
                     "error": str(e),
                     "call_statistics": None,
                     "message_statistics": None
-                })
+                }
+                
+                # Add agent information if available
+                if phone_number in agent_phone_mapping:
+                    agent_info = agent_phone_mapping[phone_number]
+                    error_result["agent_type"] = agent_info.get("agent_type")
+                    error_result["agent_name"] = agent_info.get("agent_name")
+                    error_result["agent_id"] = agent_info.get("agent_id")
+                
+                results.append(error_result)
         
         # Calculate combined summary
         combined_success_rate = (combined_stats["successful_calls"] / combined_stats["total_calls"] * 100) if combined_stats["total_calls"] > 0 else 0
@@ -208,11 +479,12 @@ async def get_multiple_numbers_analytics(
         
         return {
             "request_summary": {
-                "total_numbers_requested": len(request.phone_numbers),
+                "total_numbers_requested": len(phone_numbers_to_process),
                 "successful_numbers": len([r for r in results if r["status"] == "success"]),
                 "failed_numbers": len([r for r in results if r["status"] == "error"]),
                 "include_recent_calls": request.include_recent_calls,
-                "include_recent_messages": request.include_recent_messages
+                "include_recent_messages": request.include_recent_messages,
+                "auto_fetched_from_user_agents": not bool(request.phone_numbers)
             },
             "combined_summary": {
                 "total_calls_across_all_numbers": combined_stats["total_calls"],

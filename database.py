@@ -2,6 +2,7 @@ import psycopg
 import os
 from dotenv import load_dotenv
 from contextlib import contextmanager
+from models import Agent
 
 # Load environment variables
 load_dotenv()
@@ -141,4 +142,18 @@ def create_tables():
         """)
         
         conn.commit()
-        print("Tables created successfully!") 
+        print("Tables created successfully!")
+
+def get_agents_by_user_id(user_id: int):
+    """Get all agents for a specific user"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, agent_id, agent_name, first_message, prompt, llm,
+                   documentation_id, file_name, file_url, voice_id, twilio_number,
+                   business_name, agent_type, speaking_style, created_at, updated_at
+            FROM agents 
+            WHERE user_id = %s
+        """, (user_id,))
+        rows = cursor.fetchall()
+        return [Agent.from_db_row(row) for row in rows] 
