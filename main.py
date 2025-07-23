@@ -3,12 +3,14 @@ from fastapi import FastAPI
 from database import create_tables
 from routers import user_signup
 from routers.agent import router as agent_router
+from routers.analysis import router as analysis_router
 
 app = FastAPI(title="SpeakAI API", description="API for SpeakAI application", version="1.0.0")
 
 # Include routers
 app.include_router(user_signup.router)
 app.include_router(agent_router)
+app.include_router(analysis_router)
 
 # Create database tables on startup
 @app.on_event("startup")

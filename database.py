@@ -56,11 +56,26 @@ def create_tables():
                 name VARCHAR(255) NOT NULL,
                 company_name VARCHAR(255) NOT NULL,
                 hashed_password VARCHAR(255) NOT NULL,
+                role VARCHAR(50) DEFAULT 'Admin',
                 is_active BOOLEAN DEFAULT TRUE,
                 is_verified BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+
+        # Add role column to existing users table if it doesn't exist
+        cursor.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'role'
+                ) THEN
+                    ALTER TABLE users ADD COLUMN role VARCHAR(50) DEFAULT 'Admin';
+                    UPDATE users SET role = 'Admin' WHERE role IS NULL;
+                END IF;
+            END $$;
         """)
 
         # Create agents table

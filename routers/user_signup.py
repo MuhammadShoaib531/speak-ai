@@ -1,9 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
 from datetime import timedelta
 
 from models import User
-from schemas import UserCreate, UserResponse, UserLogin, Token
+from schemas import UserCreate, UserResponse, UserLogin, Token, UserCreateResponse
 from auth import (
     get_password_hash, 
     authenticate_user, 
@@ -20,7 +19,7 @@ router = APIRouter(
     tags=["Authentication"]
 )
 
-@router.post("/signup", response_model=UserResponse)
+@router.post("/signup", response_model=UserCreateResponse)
 async def signup(user: UserCreate):
     """
     Register a new user with name, email, password, confirm_password, and company_name
@@ -52,30 +51,13 @@ async def signup(user: UserCreate):
 async def login(user_credentials: UserLogin):
     """
     Login with email and password to get access token
+    Use this endpoint for simple Bearer token authentication
     """
     user = authenticate_user(user_credentials.email, user_credentials.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
-    )
-    return {"email: user_credentials.email, access_token": access_token, "token_type": "bearer"}
-
-@router.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    OAuth2 compatible token endpoint (for compatibility with FastAPI docs)
-    """
-    user = authenticate_user(form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)

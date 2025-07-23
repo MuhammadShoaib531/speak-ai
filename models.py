@@ -9,6 +9,7 @@ class User:
     name: str = ""
     company_name: str = ""
     hashed_password: str = ""
+    role: str = "Admin"
     is_active: bool = True
     is_verified: bool = False
     created_at: Optional[datetime] = None
@@ -25,10 +26,11 @@ class User:
             name=row[2],
             company_name=row[3],
             hashed_password=row[4],
-            is_active=row[5],
-            is_verified=row[6],
-            created_at=row[7],
-            updated_at=row[8]
+            role=row[5],
+            is_active=row[6],
+            is_verified=row[7],
+            created_at=row[8],
+            updated_at=row[9]
         )
 
 @dataclass

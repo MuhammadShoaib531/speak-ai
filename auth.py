@@ -3,7 +3,7 @@ from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 from dotenv import load_dotenv
 
@@ -18,7 +18,8 @@ ALGORITHM = os.getenv("ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+# Use HTTPBearer for simple Bearer token authentication (no client_id/client_secret needed)
+security = HTTPBearer()
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -30,20 +31,20 @@ def get_user_by_email(email: str):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, name, company_name, hashed_password, is_active, is_verified, created_at, updated_at FROM users WHERE email = %s",
+            "SELECT id, email, name, company_name, hashed_password, role, is_active, is_verified, created_at, updated_at FROM users WHERE email = %s",
             (email,)
         )
         row = cursor.fetchone()
         return User.from_db_row(row)
 
-def create_user(email: str, name: str, company_name: str, hashed_password: str):
+def create_user(email: str, name: str, company_name: str, hashed_password: str, role: str = "Admin"):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT INTO users (email, name, company_name, hashed_password) 
-               VALUES (%s, %s, %s, %s) 
-               RETURNING id, email, name, company_name, hashed_password, is_active, is_verified, created_at, updated_at""",
-            (email, name, company_name, hashed_password)
+            """INSERT INTO users (email, name, company_name, hashed_password, role) 
+               VALUES (%s, %s, %s, %s, %s) 
+               RETURNING id, email, name, company_name, hashed_password, role, is_active, is_verified, created_at, updated_at""",
+            (email, name, company_name, hashed_password, role)
         )
         row = cursor.fetchone()
         conn.commit()
@@ -69,7 +70,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
         return encoded_jwt
     raise HTTPException(status_code=500, detail="JWT configuration error")
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -78,6 +79,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         if not SECRET_KEY or not ALGORITHM:
             raise credentials_exception
+        # Extract token from credentials
+        token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
         if email is None:

@@ -23,12 +23,17 @@ class UserLogin(BaseModel):
 
 class UserResponse(UserBase):
     id: int
+    role: str
     is_active: bool
     is_verified: bool
     created_at: datetime
     
     class Config:
         from_attributes = True
+
+class UserCreateResponse(BaseModel):
+    message: str
+    user: UserResponse
 
 class Token(BaseModel):
     access_token: str
