@@ -94,4 +94,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def get_current_active_user(current_user: User = Depends(get_current_user)):
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user 
+    return current_user
+
+
+def update_user_password(user_id: int, new_password_hash: str):
+    """Update user password in database"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users 
+            SET hashed_password = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (new_password_hash, user_id))
+        
+        if cursor.rowcount == 0:
+            return False
+        
+        conn.commit()
+        return True 

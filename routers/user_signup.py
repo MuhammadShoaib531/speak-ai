@@ -3,7 +3,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from datetime import timedelta
 
 from models import User
-from schemas import UserCreate, UserResponse, UserLogin, Token, UserCreateResponse
+from schemas import UserCreate, UserResponse, UserLogin, Token, UserCreateResponse, PasswordUpdate
 from auth import (
     get_password_hash, 
     authenticate_user, 
@@ -11,6 +11,8 @@ from auth import (
     get_current_active_user,
     get_user_by_email,
     create_user,
+    verify_password,
+    update_user_password,
     ACCESS_TOKEN_EXPIRE_MINUTES
 )
 
@@ -96,4 +98,46 @@ async def protected_route(current_user: User = Depends(get_current_active_user))
     """
     Example protected route that requires authentication
     """
-    return {"message": f"Hello {current_user.name}, this is a protected route!"} 
+    return {"message": f"Hello {current_user.name}, this is a protected route!"}
+
+
+@router.put("/update-password")
+async def update_password(
+    password_data: PasswordUpdate,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Update current user's password.
+    Requires current password for verification and new password with confirmation.
+    """
+    # Verify current password
+    if not verify_password(password_data.current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect"
+        )
+    
+    # Check if new password is different from current password
+    if verify_password(password_data.new_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from current password"
+        )
+    
+    # Hash the new password
+    new_password_hash = get_password_hash(password_data.new_password)
+    
+    # Update password in database
+    success = update_user_password(current_user.id, new_password_hash)
+    
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update password"
+        )
+    
+    return {
+        "message": "Password updated successfully",
+        "user_id": current_user.id,
+        "updated_at": "now"
+    } 
