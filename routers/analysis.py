@@ -9,7 +9,7 @@ from collections import defaultdict
 
 from auth import get_current_active_user
 from models import User
-from database import get_agents_by_user_id
+from database import get_agents_by_user_id, get_all_agents
 
 router = APIRouter(
     prefix="/analysis",
@@ -55,6 +55,14 @@ def get_twilio_client():
     return Client(account_sid, auth_token)
 
 
+def get_user_agents(current_user: User):
+    """Get agents based on user role - all agents for super admin, user's agents for others"""
+    if current_user.role.lower() == "super admin":
+        return get_all_agents()
+    else:
+        return get_agents_by_user_id(current_user.id)
+
+
 @router.post("/dashboard-analytics")
 async def get_dashboard_analytics(
     current_user: User = Depends(get_current_active_user)
@@ -63,16 +71,19 @@ async def get_dashboard_analytics(
     Get analytics data formatted for dashboard display.
     Returns total calls, success rate, average duration, active agents count,
     call patterns, weekly performance, and agent performance data.
+    For super admin: shows all agents in the system.
+    For regular users: shows only their agents.
     """
     try:
         client = get_twilio_client()
         
-        # Get user's agents from database
-        user_agents = get_agents_by_user_id(current_user.id)
+        # Get agents based on user role
+        user_agents = get_user_agents(current_user)
         if not user_agents:
+            message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
             raise HTTPException(
                 status_code=404,
-                detail="No agents found for current user"
+                detail=message
             )
         
         # Extract phone numbers and create agent mapping
@@ -247,6 +258,11 @@ async def get_dashboard_analytics(
             agent_types[agent_type] = agent_types.get(agent_type, 0) + 1
         
         return {
+            "user_info": {
+                "name": current_user.name,
+                "role": current_user.role,
+                "viewing_mode": "All Agents" if current_user.role.lower() == "super admin" else "My Agents"
+            },
             "overview": {
                 "total_calls": total_calls,
                 "success_rate": f"{overall_success_rate}%",
@@ -286,16 +302,19 @@ async def get_agent_individual_analytics(
     Get individual analytics for each agent with specific details:
     agent_name, agent_type, total_calls, success_rate, average_call_duration, 
     created_at, and last_call_time (relative time like '4 hours ago').
+    For super admin: shows all agents in the system.
+    For regular users: shows only their agents.
     """
     try:
         client = get_twilio_client()
         
-        # Get user's agents from database
-        user_agents = get_agents_by_user_id(current_user.id)
+        # Get agents based on user role
+        user_agents = get_user_agents(current_user)
         if not user_agents:
+            message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
             raise HTTPException(
                 status_code=404,
-                detail="No agents found for current user"
+                detail=message
             )
         
         # Extract phone numbers and create agent mapping
@@ -471,6 +490,11 @@ async def get_agent_individual_analytics(
         overall_fallback_rate = round((total_failed_calls / total_calls_all * 100) if total_calls_all > 0 else 0, 1)
         
         return {
+            "user_info": {
+                "name": current_user.name,
+                "role": current_user.role,
+                "viewing_mode": "All Agents" if current_user.role.lower() == "super admin" else "My Agents"
+            },
             "summary": {
                 "total_agents": total_agents,
                 "active_agents": active_agents,
@@ -508,12 +532,13 @@ async def get_agent_overview_analytics(
     try:
         client = get_twilio_client()
         
-        # Get user's agents from database
-        user_agents = get_agents_by_user_id(current_user.id)
+        # Get agents based on user role
+        user_agents = get_user_agents(current_user)
         if not user_agents:
+            message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
             raise HTTPException(
                 status_code=404,
-                detail="No agents found for current user"
+                detail=message
             )
         
         # Extract phone numbers and create agent mapping
@@ -699,7 +724,11 @@ async def get_agent_overview_analytics(
         recent_activity.sort(key=sort_by_activity, reverse=True)
         
         return {
-            "user_name": current_user.name,
+            "user_info": {
+                "user_name": current_user.name,
+                "role": current_user.role,
+                "viewing_mode": "All Agents" if current_user.role.lower() == "super admin" else "My Agents"
+            },
             "total_calls": total_calls_all,
             "active_agent_count": active_agents_count,
             "success_rate": f"{success_rate}%",
@@ -740,12 +769,13 @@ async def get_multiple_numbers_analytics(
         agent_phone_mapping = {}  # Map phone numbers to agent info
         
         if not phone_numbers_to_process:
-            # Get user's agents from database
-            user_agents = get_agents_by_user_id(current_user.id)
+            # Get agents based on user role
+            user_agents = get_user_agents(current_user)
             if not user_agents:
+                message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
                 raise HTTPException(
                     status_code=404,
-                    detail="No agents found for current user"
+                    detail=message
                 )
             
             phone_numbers_to_process = []
@@ -922,6 +952,11 @@ async def get_multiple_numbers_analytics(
         combined_avg_duration = combined_stats["total_duration"] / combined_stats["successful_calls"] if combined_stats["successful_calls"] > 0 else 0
         
         return {
+            "user_info": {
+                "name": current_user.name,
+                "role": current_user.role,
+                "viewing_mode": "All Agents" if current_user.role.lower() == "super admin" else "My Agents"
+            },
             "request_summary": {
                 "total_numbers_requested": len(phone_numbers_to_process),
                 "successful_numbers": len([r for r in results if r["status"] == "success"]),

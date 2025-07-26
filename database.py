@@ -156,4 +156,18 @@ def get_agents_by_user_id(user_id: int):
             WHERE user_id = %s
         """, (user_id,))
         rows = cursor.fetchall()
+        return [Agent.from_db_row(row) for row in rows]
+
+def get_all_agents():
+    """Get all agents in the system (for super admin)"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, agent_id, agent_name, first_message, prompt, llm,
+                   documentation_id, file_name, file_url, voice_id, twilio_number,
+                   business_name, agent_type, speaking_style, created_at, updated_at
+            FROM agents 
+            ORDER BY created_at DESC
+        """)
+        rows = cursor.fetchall()
         return [Agent.from_db_row(row) for row in rows] 
