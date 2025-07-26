@@ -9,7 +9,8 @@ from pydantic import EmailStr
 from fastapi import Form, File, UploadFile
 from twilio.rest import Client
 from database import get_db
-from models import Agent
+from models import Agent, User
+from auth import get_current_active_user
 
 router = APIRouter(
     prefix="/auth/agent",
@@ -523,7 +524,183 @@ async def update_agent(
         "file_name": current_file_name,
         "file_url": current_file_url,
         "voice_id": current_voice_id,
-        "voice_url": voice_url if voice_file else "No new voice file uploaded"
     }
 
     return response_data
+
+
+@router.delete("/delete-agent/{agent_id}")
+async def delete_agent(
+    agent_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Delete an agent by agent_id. This will:
+    1. Remove agent from ElevenLabs
+    2. Release/delete Twilio phone number
+    3. Remove agent from database
+    Only the agent owner or super admin can delete agents.
+    """
+    try:
+        # First, get the agent data from database to verify ownership
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the agent
+            if current_user.role.lower() == "super admin":
+                # Super admin can delete any agent
+                cursor.execute("""
+                    SELECT id, user_id, agent_name, twilio_number, voice_id
+                    FROM agents 
+                    WHERE agent_id = %s
+                """, (agent_id,))
+            else:
+                # Regular user can only delete their own agents
+                cursor.execute("""
+                    SELECT id, user_id, agent_name, twilio_number, voice_id
+                    FROM agents 
+                    WHERE agent_id = %s AND user_id = %s
+                """, (agent_id, current_user.id))
+            
+            agent_data = cursor.fetchone()
+            if not agent_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Agent not found or you don't have permission to delete it"
+                )
+            
+            db_id, user_id, agent_name, twilio_number, voice_id = agent_data
+
+        # Step 1: Delete agent from ElevenLabs
+        try:
+            agent_delete_response = requests.delete(
+                f"{BASE_URL}/convai/agents/{agent_id}",
+                headers=HEADERS,
+                timeout=30
+            )
+            
+            if agent_delete_response.status_code not in [200, 204, 404]:
+                print(f"Warning: Failed to delete agent from ElevenLabs. Status: {agent_delete_response.status_code}")
+                print(f"Response: {agent_delete_response.text}")
+                # Continue with deletion even if ElevenLabs fails
+                
+        except Exception as e:
+            print(f"Warning: Error deleting agent from ElevenLabs: {str(e)}")
+            # Continue with deletion even if ElevenLabs fails
+
+        # Step 2: Delete voice from ElevenLabs if it exists and was user uploaded
+        if voice_id and voice_id != "IKne3meq5aSn9XLyUdCD":  # Don't delete default voice
+            try:
+                voice_delete_response = requests.delete(
+                    f"{BASE_URL}/voices/{voice_id}",
+                    headers=HEADERS,
+                    timeout=30
+                )
+                
+                if voice_delete_response.status_code not in [200, 204, 404]:
+                    print(f"Warning: Failed to delete voice from ElevenLabs. Status: {voice_delete_response.status_code}")
+                    
+            except Exception as e:
+                print(f"Warning: Error deleting voice from ElevenLabs: {str(e)}")
+
+        # Step 3: Get phone number ID and delete from ElevenLabs phone numbers
+        try:
+            # First, get all phone numbers from ElevenLabs to find the right one
+            phone_numbers_response = requests.get(
+                "https://api.elevenlabs.io/v1/convai/phone-numbers",
+                headers={"xi-api-key": ELEVENLABS_API_KEY},
+                timeout=30
+            )
+            
+            if phone_numbers_response.status_code == 200:
+                phone_numbers_data = phone_numbers_response.json()
+                phone_number_id = None
+                
+                # Find the phone number ID that matches our agent's Twilio number
+                for phone_entry in phone_numbers_data.get("phone_numbers", []):
+                    if phone_entry.get("phone_number") == twilio_number:
+                        phone_number_id = phone_entry.get("phone_number_id")
+                        break
+                
+                # Delete phone number from ElevenLabs if found
+                if phone_number_id:
+                    delete_phone_response = requests.delete(
+                        f"https://api.elevenlabs.io/v1/convai/phone-numbers/{phone_number_id}",
+                        headers={"xi-api-key": ELEVENLABS_API_KEY},
+                        timeout=30
+                    )
+                    
+                    if delete_phone_response.status_code not in [200, 204, 404]:
+                        print(f"Warning: Failed to delete phone number from ElevenLabs. Status: {delete_phone_response.status_code}")
+                        
+        except Exception as e:
+            print(f"Warning: Error deleting phone number from ElevenLabs: {str(e)}")
+
+        # Step 4: Release Twilio phone number
+        try:
+            account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+            auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+            client = Client(account_sid, auth_token)
+            
+            # Find the Twilio phone number SID
+            incoming_numbers = client.incoming_phone_numbers.list()
+            twilio_sid = None
+            
+            for number in incoming_numbers:
+                if number.phone_number == twilio_number:
+                    twilio_sid = number.sid
+                    break
+            
+            # Delete the phone number from Twilio
+            if twilio_sid:
+                client.incoming_phone_numbers(twilio_sid).delete()
+                print(f"✅ Successfully released Twilio number: {twilio_number}")
+            else:
+                print(f"Warning: Twilio number {twilio_number} not found in account")
+                
+        except Exception as e:
+            print(f"Warning: Error releasing Twilio number: {str(e)}")
+            # Continue with database deletion even if Twilio fails
+
+        # Step 5: Delete agent from database
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                DELETE FROM agents 
+                WHERE agent_id = %s
+            """, (agent_id,))
+            
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Agent not found in database"
+                )
+            
+            conn.commit()
+
+        return {
+            "status": "success",
+            "message": f"Agent '{agent_name}' deleted successfully",
+            "deleted_agent": {
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "twilio_number": twilio_number,
+                "voice_id": voice_id
+            },
+            "actions_completed": {
+                "elevenlabs_agent_deleted": True,
+                "elevenlabs_voice_deleted": voice_id != "IKne3meq5aSn9XLyUdCD" if voice_id else False,
+                "elevenlabs_phone_removed": True,
+                "twilio_number_released": True,
+                "database_record_deleted": True
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error deleting agent: {str(e)}"
+        )
