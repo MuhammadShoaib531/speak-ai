@@ -202,7 +202,10 @@ async def create_agent(
             "agent": {
                 "first_message": first_message,
                 "language": "en",
-                "prompt": prompt_block
+                "prompt": prompt_block,
+                "voice": {
+                    "voice_id": voice_id
+                }
             }
         }
     }
