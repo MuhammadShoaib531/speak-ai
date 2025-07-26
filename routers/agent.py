@@ -84,6 +84,28 @@ async def create_agent(
     file_url = None
 
     if file is not None:
+        # Validate file type - only allow PDF and DOCX
+        allowed_extensions = ['.pdf', '.docx']
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        
+        if file_extension not in allowed_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file type. Only PDF and DOCX files are allowed. Received: {file_extension}"
+            )
+        
+        # Validate file content type
+        allowed_content_types = [
+            'application/pdf',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ]
+        
+        if file.content_type not in allowed_content_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid content type. Only PDF and DOCX files are allowed. Received: {file.content_type}"
+            )
+        
         os.makedirs("uploads", exist_ok=True)
         file_path = os.path.join("uploads", file.filename)
         with open(file_path, "wb") as buffer:
@@ -94,7 +116,12 @@ async def create_agent(
         file_url = upload_to_s3(file_path, s3_key)
 
         encoded_file = base64.b64encode(open(file_path, "rb").read()).decode("utf-8")
-        files = {'file': (file.filename, base64.b64decode(encoded_file), 'application/pdf')}
+        
+        # Determine file type for ElevenLabs API
+        if file_extension == '.pdf':
+            files = {'file': (file.filename, base64.b64decode(encoded_file), 'application/pdf')}
+        elif file_extension == '.docx':
+            files = {'file': (file.filename, base64.b64decode(encoded_file), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
 
         kb_response = requests.post(
             f"{BASE_URL}/convai/knowledge-base",
@@ -126,6 +153,28 @@ async def create_agent(
     voice_url = None
     if voice_file:
         try:
+            # Validate voice file type - only allow common audio formats
+            allowed_voice_extensions = ['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac']
+            voice_file_extension = os.path.splitext(voice_file.filename)[1].lower()
+            
+            if voice_file_extension not in allowed_voice_extensions:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid voice file type. Only audio files are allowed (.mp3, .wav, .m4a, .ogg, .flac, .aac). Received: {voice_file_extension}"
+                )
+            
+            # Validate voice file content type
+            allowed_voice_content_types = [
+                'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/wave', 'audio/x-wav',
+                'audio/mp4', 'audio/m4a', 'audio/ogg', 'audio/flac', 'audio/aac'
+            ]
+            
+            if voice_file.content_type not in allowed_voice_content_types:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid voice file content type. Only audio files are allowed. Received: {voice_file.content_type}"
+                )
+            
             # Save locally first
             os.makedirs("uploads", exist_ok=True)
             voice_path = os.path.join("uploads", voice_file.filename)
@@ -259,6 +308,7 @@ async def create_agent(
         "file_url": file_url,
         "voice_id": voice_id,
         "twilio_number": twilio_number,
+        "phone_number_id": phone_number_id,
     }
 
     # Store agent data in database
@@ -275,19 +325,19 @@ async def create_agent(
             )
         user_id = user_result[0]
         
-        # Then insert the agent data
+        # Then insert the agent data including phone_number_id
         cursor.execute("""
             INSERT INTO agents (
                 user_id, agent_id, agent_name, first_message, prompt, llm,
                 documentation_id, file_name, file_url, voice_id, twilio_number,
-                business_name, agent_type, speaking_style
+                phone_number_id, business_name, agent_type, speaking_style
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             ) RETURNING id
         """, (
             user_id, agent_id, agent_name, first_message, prompt, llm,
             documentation_id, file_name, file_url, voice_id, twilio_number,
-            business_name, agent_type, speaking_style
+            phone_number_id, business_name, agent_type, speaking_style
         ))
         agent_db_id = cursor.fetchone()[0]
         conn.commit()
@@ -326,7 +376,7 @@ async def update_agent(
         # Get existing agent data by matching agent_name and user_id
         cursor.execute("""
             SELECT agent_id, agent_name, first_message, prompt, llm, documentation_id, 
-                   file_name, file_url, voice_id, business_name, agent_type, speaking_style
+                   file_name, file_url, voice_id, phone_number_id, business_name, agent_type, speaking_style
             FROM agents 
             WHERE user_id = %s AND agent_name = %s
         """, (user_id, agent_name))
@@ -349,12 +399,35 @@ async def update_agent(
         current_file_name = existing_agent[6]
         current_file_url = existing_agent[7]
         current_voice_id = existing_agent[8]
-        current_business_name = business_name if business_name else existing_agent[9]
-        current_agent_type = agent_type if agent_type else existing_agent[10]
-        current_speaking_style = speaking_style if speaking_style else existing_agent[11]
+        current_phone_number_id = existing_agent[9]  # Don't allow updating phone_number_id
+        current_business_name = business_name if business_name else existing_agent[10]
+        current_agent_type = agent_type if agent_type else existing_agent[11]
+        current_speaking_style = speaking_style if speaking_style else existing_agent[12]
 
     # Handle file upload if provided
     if file is not None:
+        # Validate file type - only allow PDF and DOCX
+        allowed_extensions = ['.pdf', '.docx']
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        
+        if file_extension not in allowed_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file type. Only PDF and DOCX files are allowed. Received: {file_extension}"
+            )
+        
+        # Validate file content type
+        allowed_content_types = [
+            'application/pdf',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ]
+        
+        if file.content_type not in allowed_content_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid content type. Only PDF and DOCX files are allowed. Received: {file.content_type}"
+            )
+        
         os.makedirs("uploads", exist_ok=True)
         file_path = os.path.join("uploads", file.filename)
         with open(file_path, "wb") as buffer:
@@ -365,7 +438,12 @@ async def update_agent(
         current_file_url = upload_to_s3(file_path, s3_key)
 
         encoded_file = base64.b64encode(open(file_path, "rb").read()).decode("utf-8")
-        files = {'file': (file.filename, base64.b64decode(encoded_file), 'application/pdf')}
+        
+        # Determine file type for ElevenLabs API
+        if file_extension == '.pdf':
+            files = {'file': (file.filename, base64.b64decode(encoded_file), 'application/pdf')}
+        elif file_extension == '.docx':
+            files = {'file': (file.filename, base64.b64decode(encoded_file), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
 
         kb_response = requests.post(
             f"{BASE_URL}/convai/knowledge-base",
@@ -399,6 +477,28 @@ async def update_agent(
     voice_url = None
     if voice_file:
         try:
+            # Validate voice file type - only allow common audio formats
+            allowed_voice_extensions = ['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac']
+            voice_file_extension = os.path.splitext(voice_file.filename)[1].lower()
+            
+            if voice_file_extension not in allowed_voice_extensions:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid voice file type. Only audio files are allowed (.mp3, .wav, .m4a, .ogg, .flac, .aac). Received: {voice_file_extension}"
+                )
+            
+            # Validate voice file content type
+            allowed_voice_content_types = [
+                'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/wave', 'audio/x-wav',
+                'audio/mp4', 'audio/m4a', 'audio/ogg', 'audio/flac', 'audio/aac'
+            ]
+            
+            if voice_file.content_type not in allowed_voice_content_types:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid voice file content type. Only audio files are allowed. Received: {voice_file.content_type}"
+                )
+            
             # Save locally first
             os.makedirs("uploads", exist_ok=True)
             voice_path = os.path.join("uploads", voice_file.filename)
@@ -498,12 +598,12 @@ async def update_agent(
             UPDATE agents SET 
                 agent_name = %s, first_message = %s, prompt = %s, llm = %s,
                 documentation_id = %s, file_name = %s, file_url = %s, voice_id = %s,
-                business_name = %s, agent_type = %s, speaking_style = %s
+                phone_number_id = %s, business_name = %s, agent_type = %s, speaking_style = %s
             WHERE agent_id = %s AND user_id = %s
         """, (
             current_agent_name, current_first_message, current_prompt, current_llm,
             current_documentation_id, current_file_name, current_file_url, current_voice_id,
-            current_business_name, current_agent_type, current_speaking_style,
+            current_phone_number_id, current_business_name, current_agent_type, current_speaking_style,
             agent_id, user_id
         ))
         
@@ -550,14 +650,14 @@ async def delete_agent(
             if current_user.role.lower() == "super admin":
                 # Super admin can delete any agent
                 cursor.execute("""
-                    SELECT id, user_id, agent_name, twilio_number, voice_id
+                    SELECT id, user_id, agent_name, twilio_number, voice_id, phone_number_id
                     FROM agents 
                     WHERE agent_id = %s
                 """, (agent_id,))
             else:
                 # Regular user can only delete their own agents
                 cursor.execute("""
-                    SELECT id, user_id, agent_name, twilio_number, voice_id
+                    SELECT id, user_id, agent_name, twilio_number, voice_id, phone_number_id
                     FROM agents 
                     WHERE agent_id = %s AND user_id = %s
                 """, (agent_id, current_user.id))
@@ -569,7 +669,7 @@ async def delete_agent(
                     detail="Agent not found or you don't have permission to delete it"
                 )
             
-            db_id, user_id, agent_name, twilio_number, voice_id = agent_data
+            db_id, user_id, agent_name, twilio_number, voice_id, phone_number_id = agent_data
 
         # Step 1: Delete agent from ElevenLabs
         try:
@@ -603,38 +703,27 @@ async def delete_agent(
             except Exception as e:
                 print(f"Warning: Error deleting voice from ElevenLabs: {str(e)}")
 
-        # Step 3: Get phone number ID and delete from ElevenLabs phone numbers
-        try:
-            # First, get all phone numbers from ElevenLabs to find the right one
-            phone_numbers_response = requests.get(
-                "https://api.elevenlabs.io/v1/convai/phone-numbers",
-                headers={"xi-api-key": ELEVENLABS_API_KEY},
-                timeout=30
-            )
-            
-            if phone_numbers_response.status_code == 200:
-                phone_numbers_data = phone_numbers_response.json()
-                phone_number_id = None
+        # Step 3: Delete phone number from ElevenLabs using stored phone_number_id
+        if phone_number_id:
+            try:
+                delete_phone_response = requests.delete(
+                    f"https://api.elevenlabs.io/v1/convai/phone-numbers/{phone_number_id}",
+                    headers={"xi-api-key": ELEVENLABS_API_KEY},
+                    timeout=30
+                )
                 
-                # Find the phone number ID that matches our agent's Twilio number
-                for phone_entry in phone_numbers_data.get("phone_numbers", []):
-                    if phone_entry.get("phone_number") == twilio_number:
-                        phone_number_id = phone_entry.get("phone_number_id")
-                        break
-                
-                # Delete phone number from ElevenLabs if found
-                if phone_number_id:
-                    delete_phone_response = requests.delete(
-                        f"https://api.elevenlabs.io/v1/convai/phone-numbers/{phone_number_id}",
-                        headers={"xi-api-key": ELEVENLABS_API_KEY},
-                        timeout=30
-                    )
+                if delete_phone_response.status_code in [200, 204]:
+                    print(f"✅ Successfully deleted phone number from ElevenLabs: {phone_number_id}")
+                elif delete_phone_response.status_code == 404:
+                    print(f"Warning: Phone number {phone_number_id} not found in ElevenLabs (already deleted)")
+                else:
+                    print(f"Warning: Failed to delete phone number from ElevenLabs. Status: {delete_phone_response.status_code}")
+                    print(f"Response: {delete_phone_response.text}")
                     
-                    if delete_phone_response.status_code not in [200, 204, 404]:
-                        print(f"Warning: Failed to delete phone number from ElevenLabs. Status: {delete_phone_response.status_code}")
-                        
-        except Exception as e:
-            print(f"Warning: Error deleting phone number from ElevenLabs: {str(e)}")
+            except Exception as e:
+                print(f"Warning: Error deleting phone number from ElevenLabs: {str(e)}")
+        else:
+            print("Warning: No phone_number_id found in database for this agent")
 
         # Step 4: Release Twilio phone number
         try:
@@ -704,3 +793,160 @@ async def delete_agent(
             status_code=500,
             detail=f"Error deleting agent: {str(e)}"
         )
+
+
+@router.patch("/pause-twilio-number/{agent_id}")
+async def pause_twilio_number(
+    agent_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Pause a Twilio phone number associated with an agent.
+    This removes the agent association from the ElevenLabs phone number.
+    Only agent owner or super admin can pause numbers.
+    """
+    try:
+        # Get agent data from database to verify ownership and get phone number
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the agent
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    FROM agents 
+                    WHERE agent_id = %s
+                """, (agent_id,))
+            else:
+                cursor.execute("""
+                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    FROM agents 
+                    WHERE agent_id = %s AND user_id = %s
+                """, (agent_id, current_user.id))
+            
+            agent_data = cursor.fetchone()
+            if not agent_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Agent not found or you don't have permission to modify it"
+                )
+            
+            agent_name, phone_number_id, twilio_number, user_id = agent_data
+
+        if not phone_number_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No phone number ID found for this agent"
+            )
+
+        print(f"Pausing phone number: {phone_number_id}")
+
+        # Remove agent association from ElevenLabs phone number (pause it)
+        response = requests.patch(f"https://api.elevenlabs.io/v1/convai/phone-numbers/{phone_number_id}",
+         headers={
+        "xi-api-key": ELEVENLABS_API_KEY
+        },
+        json={
+        "agent_id": None  # Remove agent association to pause
+        },
+        )
+        
+        if response.status_code == 200:
+            print("✅ Phone number successfully paused (agent unlinked).")
+            return {
+                "status": "success",
+                "message": f"Twilio number {twilio_number} has been paused",
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "twilio_number": twilio_number,
+                "phone_number_id": phone_number_id,
+                "current_status": "paused",
+                "updated_by": current_user.name
+            }
+        else:
+            print(f"❌ Failed to pause phone number. Status: {response.status_code}")
+            print("Response:", response.text)
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Failed to pause phone number: {response.text}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error pausing phone number: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error pausing phone number: {str(e)}"
+        )
+
+
+@router.patch("/resume-twilio-number/{agent_id}")
+async def resume_twilio_number(
+    agent_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Resume a paused Twilio phone number associated with an agent.
+    This re-enables incoming calls by restoring the ElevenLabs webhook URL.
+    Only agent owner or super admin can resume numbers.
+    """
+    try:
+        # Get agent data from database
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the agent
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    FROM agents 
+                    WHERE agent_id = %s
+                """, (agent_id,))
+            else:
+                cursor.execute("""
+                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    FROM agents 
+                    WHERE agent_id = %s AND user_id = %s
+                """, (agent_id, current_user.id))
+            
+            agent_data = cursor.fetchone()
+            if not agent_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Agent not found or you don't have permission to modify it"
+                )
+            
+            agent_name, phone_number_id, twilio_number, user_id = agent_data
+        print(phone_number_id)
+
+        response = requests.patch(f"https://api.elevenlabs.io/v1/convai/phone-numbers/{phone_number_id}",
+         headers={
+        "xi-api-key": ELEVENLABS_API_KEY
+        },
+        json={
+        "agent_id": agent_id
+        },
+        )
+        if response.status_code == 200:
+            print("✅ Phone number successfully linked to agent.")
+        else:
+            print(f"❌ Failed to update phone number. Status: {response.status_code}")
+            print("Response:", response.text)
+        return {
+            "status": "success",
+            "message": f"Twilio number {twilio_number} has been resumed",
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "twilio_number": twilio_number,
+            "phone_number_id": phone_number_id,
+            "updated_by": current_user.name
+        }
+    except Exception as e:
+        print(f"❌ Error linking phone number: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error linking phone number: {str(e)}"
+        )
+        
+

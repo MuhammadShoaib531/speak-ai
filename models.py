@@ -47,6 +47,7 @@ class Agent:
     file_url: Optional[str] = None
     voice_id: Optional[str] = None
     twilio_number: str = ""
+    phone_number_id: Optional[str] = None
     business_name: Optional[str] = None
     agent_type: Optional[str] = None
     speaking_style: Optional[str] = None
@@ -71,9 +72,10 @@ class Agent:
             file_url=row[9],
             voice_id=row[10],
             twilio_number=row[11],
-            business_name=row[12],
-            agent_type=row[13],
-            speaking_style=row[14],
-            created_at=row[15],
-            updated_at=row[16]
+            phone_number_id=row[12],
+            business_name=row[13],
+            agent_type=row[14],
+            speaking_style=row[15],
+            created_at=row[16],
+            updated_at=row[17]
         ) 

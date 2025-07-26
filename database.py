@@ -151,7 +151,7 @@ def get_agents_by_user_id(user_id: int):
         cursor.execute("""
             SELECT id, user_id, agent_id, agent_name, first_message, prompt, llm,
                    documentation_id, file_name, file_url, voice_id, twilio_number,
-                   business_name, agent_type, speaking_style, created_at, updated_at
+                   phone_number_id, business_name, agent_type, speaking_style, created_at, updated_at
             FROM agents 
             WHERE user_id = %s
         """, (user_id,))
@@ -165,7 +165,7 @@ def get_all_agents():
         cursor.execute("""
             SELECT id, user_id, agent_id, agent_name, first_message, prompt, llm,
                    documentation_id, file_name, file_url, voice_id, twilio_number,
-                   business_name, agent_type, speaking_style, created_at, updated_at
+                   phone_number_id, business_name, agent_type, speaking_style, created_at, updated_at
             FROM agents 
             ORDER BY created_at DESC
         """)
