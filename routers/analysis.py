@@ -80,11 +80,30 @@ async def get_dashboard_analytics(
         # Get agents based on user role
         user_agents = get_user_agents(current_user)
         if not user_agents:
-            message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
-            raise HTTPException(
-                status_code=404,
-                detail=message
-            )
+            # Return empty analytics data instead of error
+            return {
+                "status": "success",
+                "message": "No agents found",
+                "data": {
+                    "overview": {
+                        "total_calls": 0,
+                        "successful_calls": 0,
+                        "success_rate": 0,
+                        "average_duration": 0,
+                        "active_agents": 0
+                    },
+                    "call_patterns": {
+                        "hourly": {str(i): 0 for i in range(24)},
+                        "success_rate_by_hour": {str(i): 0 for i in range(24)}
+                    },
+                    "weekly_performance": {
+                        "Mon": 0, "Tue": 0, "Wed": 0, "Thu": 0, 
+                        "Fri": 0, "Sat": 0, "Sun": 0
+                    },
+                    "agent_performance": [],
+                    "top_performing_agents": []
+                }
+            }
         
         # Extract phone numbers and create agent mapping
         phone_numbers = []
@@ -100,10 +119,30 @@ async def get_dashboard_analytics(
                 }
         
         if not phone_numbers:
-            raise HTTPException(
-                status_code=404,
-                detail="No phone numbers found to analyze"
-            )
+            # Return empty analytics data instead of error
+            return {
+                "status": "success",
+                "message": "No phone numbers configured for agents",
+                "data": {
+                    "overview": {
+                        "total_calls": 0,
+                        "successful_calls": 0,
+                        "success_rate": 0,
+                        "average_duration": 0,
+                        "active_agents": len(user_agents)
+                    },
+                    "call_patterns": {
+                        "hourly": {str(i): 0 for i in range(24)},
+                        "success_rate_by_hour": {str(i): 0 for i in range(24)}
+                    },
+                    "weekly_performance": {
+                        "Mon": 0, "Tue": 0, "Wed": 0, "Thu": 0, 
+                        "Fri": 0, "Sat": 0, "Sun": 0
+                    },
+                    "agent_performance": [],
+                    "top_performing_agents": []
+                }
+            }
         
         # Initialize data structures
         all_calls = []
@@ -311,11 +350,14 @@ async def get_agent_individual_analytics(
         # Get agents based on user role
         user_agents = get_user_agents(current_user)
         if not user_agents:
-            message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
-            raise HTTPException(
-                status_code=404,
-                detail=message
-            )
+            # Return empty analytics data instead of error
+            return {
+                "status": "success",
+                "message": "No agents found",
+                "data": {
+                    "agent_analytics": []
+                }
+            }
         
         # Extract phone numbers and create agent mapping
         phone_numbers = []
@@ -332,10 +374,26 @@ async def get_agent_individual_analytics(
                 }
         
         if not phone_numbers:
-            raise HTTPException(
-                status_code=404,
-                detail="No phone numbers found to analyze"
-            )
+            # Return analytics with agents but no calls
+            agent_analytics = []
+            for agent in user_agents:
+                agent_analytics.append({
+                    "agent_name": agent.agent_name,
+                    "agent_type": agent.agent_type or "Unknown",
+                    "total_calls": 0,
+                    "success_rate": 0,
+                    "average_call_duration": 0,
+                    "created_at": agent.created_at.isoformat() if agent.created_at else None,
+                    "last_call_time": "No calls yet"
+                })
+            
+            return {
+                "status": "success",
+                "message": "No phone numbers configured for agents",
+                "data": {
+                    "agent_analytics": agent_analytics
+                }
+            }
         
         # Helper function to calculate relative time
         def get_relative_time(timestamp):
@@ -535,11 +593,24 @@ async def get_agent_overview_analytics(
         # Get agents based on user role
         user_agents = get_user_agents(current_user)
         if not user_agents:
-            message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
-            raise HTTPException(
-                status_code=404,
-                detail=message
-            )
+            # Return empty overview analytics instead of error
+            return {
+                "status": "success",
+                "message": "No agents found",
+                "data": {
+                    "overview": {
+                        "total_calls": 0,
+                        "active_agents": 0,
+                        "success_rate": "0%",
+                        "success_rate_value": 0,
+                        "fallback_rate": "0%",
+                        "fallback_rate_value": 0,
+                        "data_period_days": 30
+                    },
+                    "individual_results": [],
+                    "recent_activity": []
+                }
+            }
         
         # Extract phone numbers and create agent mapping
         phone_numbers = []
@@ -556,10 +627,36 @@ async def get_agent_overview_analytics(
                 }
         
         if not phone_numbers:
-            raise HTTPException(
-                status_code=404,
-                detail="No phone numbers found to analyze"
-            )
+            # Return overview with agents but no calls
+            individual_results = []
+            for agent in user_agents:
+                individual_results.append({
+                    "agent_name": agent.agent_name,
+                    "agent_type": agent.agent_type or "Unknown",
+                    "total_calls": 0,
+                    "success_rate": 0,
+                    "fallback_rate": 0,
+                    "created_at": agent.created_at.isoformat() if agent.created_at else None,
+                    "last_call_time": "No calls yet"
+                })
+            
+            return {
+                "status": "success",
+                "message": "No phone numbers configured for agents",
+                "data": {
+                    "overview": {
+                        "total_calls": 0,
+                        "active_agents": len(user_agents),
+                        "success_rate": "0%",
+                        "success_rate_value": 0,
+                        "fallback_rate": "0%",
+                        "fallback_rate_value": 0,
+                        "data_period_days": 30
+                    },
+                    "individual_results": individual_results,
+                    "recent_activity": []
+                }
+            }
         
         # Helper function to calculate relative time
         def get_relative_time(timestamp):
@@ -772,11 +869,39 @@ async def get_multiple_numbers_analytics(
             # Get agents based on user role
             user_agents = get_user_agents(current_user)
             if not user_agents:
-                message = "No agents found in the system" if current_user.role.lower() == "super admin" else "No agents found for current user"
-                raise HTTPException(
-                    status_code=404,
-                    detail=message
-                )
+                # Return empty analytics data instead of error
+                return {
+                    "status": "success",
+                    "message": "No agents found",
+                    "data": {
+                        "user_info": {
+                            "name": current_user.name,
+                            "role": current_user.role,
+                            "viewing_mode": "All Agents" if current_user.role.lower() == "super admin" else "My Agents"
+                        },
+                        "request_summary": {
+                            "total_numbers_requested": 0,
+                            "successful_numbers": 0,
+                            "failed_numbers": 0,
+                            "include_recent_calls": request.include_recent_calls,
+                            "include_recent_messages": request.include_recent_messages,
+                            "auto_fetched_from_user_agents": True
+                        },
+                        "combined_summary": {
+                            "total_calls_across_all_numbers": 0,
+                            "total_messages_across_all_numbers": 0,
+                            "total_duration_seconds": 0,
+                            "total_duration_formatted": "0h 0m 0s",
+                            "successful_calls_across_all_numbers": 0,
+                            "failed_calls_across_all_numbers": 0,
+                            "combined_success_rate_percentage": 0,
+                            "combined_failure_rate_percentage": 0,
+                            "combined_average_duration_seconds": 0,
+                            "combined_average_duration_formatted": "0s"
+                        },
+                        "individual_results": []
+                    }
+                }
             
             phone_numbers_to_process = []
             for agent in user_agents:
@@ -789,10 +914,39 @@ async def get_multiple_numbers_analytics(
                     }
         
         if not phone_numbers_to_process:
-            raise HTTPException(
-                status_code=404,
-                detail="No phone numbers found to analyze"
-            )
+            # Return analytics with agents but no phone numbers
+            return {
+                "status": "success",
+                "message": "No phone numbers configured for agents",
+                "data": {
+                    "user_info": {
+                        "name": current_user.name,
+                        "role": current_user.role,
+                        "viewing_mode": "All Agents" if current_user.role.lower() == "super admin" else "My Agents"
+                    },
+                    "request_summary": {
+                        "total_numbers_requested": 0,
+                        "successful_numbers": 0,
+                        "failed_numbers": 0,
+                        "include_recent_calls": request.include_recent_calls,
+                        "include_recent_messages": request.include_recent_messages,
+                        "auto_fetched_from_user_agents": True
+                    },
+                    "combined_summary": {
+                        "total_calls_across_all_numbers": 0,
+                        "total_messages_across_all_numbers": 0,
+                        "total_duration_seconds": 0,
+                        "total_duration_formatted": "0h 0m 0s",
+                        "successful_calls_across_all_numbers": 0,
+                        "failed_calls_across_all_numbers": 0,
+                        "combined_success_rate_percentage": 0,
+                        "combined_failure_rate_percentage": 0,
+                        "combined_average_duration_seconds": 0,
+                        "combined_average_duration_formatted": "0s"
+                    },
+                    "individual_results": []
+                }
+            }
         
         results = []
         combined_stats = {
