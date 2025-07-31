@@ -5,7 +5,10 @@ import os
 import shutil
 import base64
 import requests
-from pydantic import EmailStr
+import csv
+import io
+from typing import List, Dict, Optional
+from pydantic import EmailStr, BaseModel
 from fastapi import Form, File, UploadFile
 from twilio.rest import Client
 from database import get_db
@@ -947,6 +950,470 @@ async def resume_twilio_number(
         raise HTTPException(
             status_code=500,
             detail=f"Error linking phone number: {str(e)}"
+        )
+
+
+# Pydantic models for batch calling
+class BatchCallRecipient(BaseModel):
+    phone_number: str
+
+class BatchCallResult(BaseModel):
+    phone_number: str
+    status: str
+    call_id: Optional[str] = None
+    error: Optional[str] = None
+
+class BatchCallResponse(BaseModel):
+    status: str
+    message: str
+    agent_id: str
+    agent_name: str
+    batch_job_id: Optional[str] = None
+    call_name: str
+    total_numbers: int
+    scheduled_time: Optional[str] = None
+    recipients: List[BatchCallRecipient]
+
+
+@router.post("/batch-calling", response_model=BatchCallResponse)
+async def batch_calling(
+    agent_id: str = Form(...),
+    csv_file: UploadFile = File(...),
+    phone_column: str = Form("phone"),  # Default column name for phone numbers
+    call_name: str = Form(...),  # Name for the batch calling job
+    scheduled_time_unix: Optional[int] = Form(None),  # Optional scheduled time (Unix timestamp)
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Perform batch calling using ElevenLabs batch calling API with a CSV file containing phone numbers.
+    
+    Args:
+        agent_id: The ID of the agent to use for calling
+        csv_file: CSV file containing phone numbers
+        phone_column: Name of the column containing phone numbers (default: 'phone')
+        call_name: Name for the batch calling job
+        scheduled_time_unix: Optional Unix timestamp for scheduling calls (if not provided, calls start immediately)
+        
+    Returns:
+        BatchCallResponse with batch job details
+    """
+    try:
+        # Validate CSV file type
+        if not csv_file.filename.endswith('.csv'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only CSV files are allowed"
+            )
+        
+        # Validate CSV content type
+        if csv_file.content_type not in ['text/csv', 'application/csv', 'application/vnd.ms-excel']:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid content type. Expected CSV file. Received: {csv_file.content_type}"
+            )
+        
+        # Get agent data from database to verify ownership and get phone number
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the agent
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    FROM agents 
+                    WHERE agent_id = %s
+                """, (agent_id,))
+            else:
+                cursor.execute("""
+                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    FROM agents 
+                    WHERE agent_id = %s AND user_id = %s
+                """, (agent_id, current_user.id))
+            
+            agent_data = cursor.fetchone()
+            if not agent_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Agent not found or you don't have permission to use it"
+                )
+            
+            agent_name, phone_number_id, twilio_number, user_id = agent_data
+
+        if not phone_number_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Agent doesn't have a phone number configured"
+            )
+
+        # Read and parse CSV file
+        csv_content = await csv_file.read()
+        csv_string = csv_content.decode('utf-8')
+        csv_reader = csv.DictReader(io.StringIO(csv_string))
+        
+        # Extract phone numbers from CSV
+        phone_numbers = []
+        row_count = 0
+        
+        for row in csv_reader:
+            row_count += 1
+            if phone_column not in row:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Column '{phone_column}' not found in CSV. Available columns: {list(row.keys())}"
+                )
+            
+            phone_number = row[phone_column].strip()
+            if phone_number:  # Only add non-empty phone numbers
+                # Basic phone number validation (remove spaces, dashes, etc.)
+                cleaned_phone = ''.join(filter(str.isdigit, phone_number))
+                if len(cleaned_phone) >= 10:  # Minimum valid phone number length
+                    # Add country code if not present
+                    if not cleaned_phone.startswith('1') and len(cleaned_phone) == 10:
+                        cleaned_phone = '1' + cleaned_phone
+                    phone_numbers.append(f"+{cleaned_phone}")
+                else:
+                    print(f"Skipping invalid phone number: {phone_number}")
+        
+        if not phone_numbers:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid phone numbers found in CSV file"
+            )
+        
+        print(f"Found {len(phone_numbers)} valid phone numbers for batch calling")
+        
+        # Prepare recipients for ElevenLabs batch calling API
+        recipients = [{"phone_number": phone} for phone in phone_numbers]
+        
+        # Prepare the batch calling payload
+        batch_payload = {
+            "call_name": call_name,
+            "agent_id": agent_id,
+            "agent_phone_number_id": phone_number_id,
+            "recipients": recipients
+        }
+        
+        
+        # Add scheduled time if provided
+        if scheduled_time_unix:
+            batch_payload["scheduled_time_unix"] = scheduled_time_unix
+        else:
+            batch_payload["scheduled_time_unix"] = 42
+        print(batch_payload)
+        # Submit batch calling job to ElevenLabs
+        batch_response = requests.post(
+            "https://api.elevenlabs.io/v1/convai/batch-calling/submit",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json=batch_payload,
+            timeout=30
+        )
+        
+        if batch_response.status_code != 200:
+            raise HTTPException(
+                status_code=batch_response.status_code,
+                detail=f"ElevenLabs batch calling failed: {batch_response.text}"
+            )
+        
+        batch_result = batch_response.json()
+        batch_job_id = batch_result.get("batch_id") or batch_result.get("id")
+        
+        print(f"✅ Batch calling job submitted successfully. Job ID: {batch_job_id}")
+        
+        # Store batch call record in database
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Insert batch calling record for tracking
+            cursor.execute("""
+                INSERT INTO batch_calls (
+                    user_id, agent_id, batch_job_id, call_name, total_numbers,
+                    scheduled_time_unix, status, created_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+            """, (
+                user_id, agent_id, batch_job_id, call_name, len(phone_numbers),
+                scheduled_time_unix, "submitted"
+            ))
+            conn.commit()
+            print(f"Batch calling record saved to database")
+        
+        # Format response
+        scheduled_time_str = None
+        if scheduled_time_unix:
+            from datetime import datetime
+            scheduled_time_str = datetime.fromtimestamp(scheduled_time_unix).isoformat()
+        
+        return BatchCallResponse(
+            status="success",
+            message=f"Batch calling job submitted successfully. {len(phone_numbers)} numbers queued for calling.",
+            agent_id=agent_id,
+            agent_name=agent_name,
+            batch_job_id=batch_job_id,
+            call_name=call_name,
+            total_numbers=len(phone_numbers),
+            scheduled_time=scheduled_time_str,
+            recipients=[BatchCallRecipient(phone_number=phone) for phone in phone_numbers]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing batch calls: {str(e)}"
+        )
+
+
+@router.get("/batch-calling-status/{call_name}")
+async def get_batch_calling_status(
+    call_name: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Get the status of a batch calling job from ElevenLabs using call_name.
+    
+    Args:
+        call_name: The name of the batch calling job
+        
+    Returns:
+        Batch calling job status and details
+    """
+    try:
+        # Get batch_job_id from database using call_name
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the batch job
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT id, batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
+                    FROM batch_calls 
+                    WHERE call_name = %s
+                """, (call_name,))
+            else:
+                cursor.execute("""
+                    SELECT id, batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
+                    FROM batch_calls 
+                    WHERE call_name = %s AND user_id = %s
+                """, (call_name, current_user.id))
+            
+            batch_record = cursor.fetchone()
+            if not batch_record:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Batch calling job not found or you don't have permission to view it"
+                )
+            
+            batch_job_id = batch_record[1]
+        
+        # Get batch calling status from ElevenLabs
+        status_response = requests.get(
+            f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY
+            },
+            timeout=30
+        )
+        
+        if status_response.status_code != 200:
+            raise HTTPException(
+                status_code=status_response.status_code,
+                detail=f"Failed to get batch calling status: {status_response.text}"
+            )
+        
+        batch_status = status_response.json()
+        
+        return {
+            "status": "success",
+            "call_name": call_name,
+            "batch_job_id": batch_job_id,
+            "local_record": {
+                "call_name": batch_record[2],
+                "total_numbers": batch_record[3],
+                "scheduled_time_unix": batch_record[4],
+                "local_status": batch_record[5],
+                "created_at": batch_record[6].isoformat() if batch_record[6] else None
+            },
+            "elevenlabs_status": batch_status
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting batch calling status: {str(e)}"
+        )
+
+
+@router.post("/batch-calling-cancel/{call_name}")
+async def cancel_batch_calling(
+    call_name: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Cancel a batch calling job using call_name.
+    
+    Args:
+        call_name: The name of the batch calling job to cancel
+        
+    Returns:
+        Cancellation status and details
+    """
+    try:
+        # Get batch_job_id from database using call_name
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the batch job
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT id, batch_job_id, call_name, total_numbers, status, created_at, user_id
+                    FROM batch_calls 
+                    WHERE call_name = %s
+                """, (call_name,))
+            else:
+                cursor.execute("""
+                    SELECT id, batch_job_id, call_name, total_numbers, status, created_at, user_id
+                    FROM batch_calls 
+                    WHERE call_name = %s AND user_id = %s
+                """, (call_name, current_user.id))
+            
+            batch_record = cursor.fetchone()
+            if not batch_record:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Batch calling job not found or you don't have permission to cancel it"
+                )
+            
+            batch_job_id = batch_record[1]
+            current_status = batch_record[4]
+        
+        # Check if the job can be cancelled
+        if current_status in ["cancelled", "completed", "failed"]:
+            return {
+                "status": "info",
+                "message": f"Batch calling job '{call_name}' is already {current_status} and cannot be cancelled",
+                "call_name": call_name,
+                "batch_job_id": batch_job_id,
+                "current_status": current_status
+            }
+        
+        # Cancel batch calling job via ElevenLabs API
+        cancel_response = requests.post(
+            f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}/cancel",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY
+            },
+            timeout=30
+        )
+        
+        if cancel_response.status_code != 200:
+            raise HTTPException(
+                status_code=cancel_response.status_code,
+                detail=f"Failed to cancel batch calling job: {cancel_response.text}"
+            )
+        
+        cancel_result = cancel_response.json()
+        
+        # Update local database status
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE batch_calls 
+                SET status = %s, updated_at = NOW()
+                WHERE batch_job_id = %s
+            """, ("cancelled", batch_job_id))
+            conn.commit()
+            
+            print(f"✅ Batch calling job {call_name} cancelled and database updated")
+        
+        return {
+            "status": "success",
+            "message": f"Batch calling job '{call_name}' has been cancelled successfully",
+            "call_name": call_name,
+            "batch_job_id": batch_job_id,
+            "cancelled_by": current_user.name,
+            "elevenlabs_response": cancel_result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error cancelling batch calling job: {str(e)}"
+        )
+
+
+@router.get("/batch-calling-jobs")
+async def list_batch_calling_jobs(
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    List all batch calling jobs for the current user.
+    Super admin can see all jobs.
+    
+    Returns:
+        List of batch calling jobs
+    """
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or regular user
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT bc.batch_job_id, bc.call_name, bc.total_numbers, 
+                           bc.scheduled_time_unix, bc.status, bc.created_at,
+                           a.agent_name, u.name as user_name
+                    FROM batch_calls bc
+                    JOIN agents a ON bc.agent_id = a.agent_id
+                    JOIN users u ON bc.user_id = u.id
+                    ORDER BY bc.created_at DESC
+                """)
+            else:
+                cursor.execute("""
+                    SELECT bc.batch_job_id, bc.call_name, bc.total_numbers, 
+                           bc.scheduled_time_unix, bc.status, bc.created_at,
+                           a.agent_name, u.name as user_name
+                    FROM batch_calls bc
+                    JOIN agents a ON bc.agent_id = a.agent_id
+                    JOIN users u ON bc.user_id = u.id
+                    WHERE bc.user_id = %s
+                    ORDER BY bc.created_at DESC
+                """, (current_user.id,))
+            
+            batch_jobs = cursor.fetchall()
+            
+            jobs_list = []
+            for job in batch_jobs:
+                jobs_list.append({
+                    "batch_job_id": job[0],
+                    "call_name": job[1],
+                    "total_numbers": job[2],
+                    "scheduled_time_unix": job[3],
+                    "status": job[4],
+                    "created_at": job[5].isoformat() if job[5] else None,
+                    "agent_name": job[6],
+                    "user_name": job[7]
+                })
+            
+            return {
+                "status": "success",
+                "total_jobs": len(jobs_list),
+                "jobs": jobs_list
+            }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error listing batch calling jobs: {str(e)}"
         )
         
 
