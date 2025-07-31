@@ -7,14 +7,15 @@ import base64
 import requests
 import csv
 import io
+from datetime import datetime
+from dateutil import parser as date_parser
+import pytz
 from typing import List, Dict, Optional
 from pydantic import EmailStr, BaseModel
 from fastapi import Form, File, UploadFile
 from twilio.rest import Client
 from database import get_db
 from models import Agent, User
-from datetime import datetime, time, timedelta
-import re
 from auth import get_current_active_user
 
 router = APIRouter(
@@ -28,6 +29,120 @@ HEADERS = {
         "xi-api-key": ELEVENLABS_API_KEY
     }
 
+
+def parse_human_datetime(datetime_str: str) -> int:
+    """
+    Parse human-readable datetime string to Unix timestamp.
+    
+    Supports various formats:
+    - "2025-12-21 2 PM" or "2025-12-21 14:00"
+    - "Dec 21, 2025 2:00 PM" 
+    - "December 21, 2025 14:00"
+    - "2025/12/21 2:00 PM"
+    - "21-12-2025 14:00"
+    - "2025-12-21T14:00:00" (ISO format)
+    
+    Returns Unix timestamp
+    """
+    try:
+        datetime_str = datetime_str.strip()
+        
+        # Try dateutil parser first if available
+        try:
+            dt = date_parser.parse(datetime_str)
+            # Convert to Unix timestamp
+            return int(dt.timestamp())
+        except (ImportError, NameError):
+            # Fallback to manual parsing if dateutil is not available
+            pass
+        except:
+            # Continue to manual parsing if dateutil fails
+            pass
+        
+        # Manual parsing for common formats
+        
+        # Handle ISO format: "2025-12-21T14:00:00"
+        if "T" in datetime_str:
+            dt = datetime.fromisoformat(datetime_str.replace("T", " "))
+            return int(dt.timestamp())
+        
+        # Handle AM/PM formats: "2025-12-21 2 PM"
+        if " PM" in datetime_str.upper() or " AM" in datetime_str.upper():
+            # Remove extra spaces and normalize
+            datetime_str = " ".join(datetime_str.split())
+            if " PM" in datetime_str.upper():
+                datetime_str = datetime_str.upper().replace(" PM", " PM")
+                dt = datetime.strptime(datetime_str, "%Y-%m-%d %I %p")
+            else:
+                datetime_str = datetime_str.upper().replace(" AM", " AM")
+                dt = datetime.strptime(datetime_str, "%Y-%m-%d %I %p")
+            return int(dt.timestamp())
+        
+        # Handle 24-hour format: "2025-12-21 14:00"
+        if ":" in datetime_str and "-" in datetime_str:
+            # Try different separators
+            for sep in ["-", "/"]:
+                if sep in datetime_str:
+                    try:
+                        dt = datetime.strptime(datetime_str, f"%Y{sep}%m{sep}%d %H:%M")
+                        return int(dt.timestamp())
+                    except:
+                        try:
+                            dt = datetime.strptime(datetime_str, f"%d{sep}%m{sep}%Y %H:%M")
+                            return int(dt.timestamp())
+                        except:
+                            continue
+        
+        # Handle date only formats by adding default time (12:00 PM)
+        if datetime_str.count("-") == 2 and ":" not in datetime_str:
+            datetime_str += " 12:00"
+            dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
+            return int(dt.timestamp())
+        
+        raise ValueError(f"Unsupported datetime format: {datetime_str}")
+        
+    except Exception as e:
+        raise ValueError(f"Invalid datetime format '{datetime_str}'. Supported formats: '2025-12-21 2 PM', '2025-12-21 14:00', '2025-12-21T14:00:00', etc. Error: {str(e)}")
+
+
+def parse_human_datetime_simple(datetime_str: str) -> int:
+    """
+    Simple datetime parser that doesn't require external libraries.
+    Supports basic formats without advanced parsing.
+    """
+    try:
+        datetime_str = datetime_str.strip()
+        
+        # Handle ISO format: "2025-12-21T14:00:00"
+        if "T" in datetime_str:
+            dt = datetime.fromisoformat(datetime_str.replace("T", " "))
+            return int(dt.timestamp())
+        
+        # Handle AM/PM formats: "2025-12-21 2 PM"
+        if " PM" in datetime_str.upper():
+            datetime_str = datetime_str.upper().replace(" PM", " PM")
+            dt = datetime.strptime(datetime_str, "%Y-%m-%d %I %p")
+            return int(dt.timestamp())
+        elif " AM" in datetime_str.upper():
+            datetime_str = datetime_str.upper().replace(" AM", " AM")  
+            dt = datetime.strptime(datetime_str, "%Y-%m-%d %I %p")
+            return int(dt.timestamp())
+        
+        # Handle 24-hour format: "2025-12-21 14:00"
+        if ":" in datetime_str and "-" in datetime_str:
+            dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
+            return int(dt.timestamp())
+        
+        # Handle date only by adding 12:00
+        if datetime_str.count("-") == 2:
+            datetime_str += " 12:00"
+            dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
+            return int(dt.timestamp())
+        
+        raise ValueError(f"Unsupported format: {datetime_str}")
+        
+    except Exception as e:
+        raise ValueError(f"Invalid datetime format '{datetime_str}'. Use formats like: '2025-12-21 2 PM', '2025-12-21 14:00', '2025-12-21T14:00:00'. Error: {str(e)}")
 
 
 def upload_to_s3(file_path: str, s3_key: str) -> str:
@@ -977,100 +1092,14 @@ class BatchCallResponse(BaseModel):
     recipients: List[BatchCallRecipient]
 
 
-def parse_human_time_to_unix(time_str: str) -> int:
-    """
-    Parse human-readable time formats to Unix timestamp.
-    
-    Supported formats:
-    - "2 PM", "2:30 PM", "14:30", "2:30 pm"
-    - "2pm", "2:30pm", "14:30:00"
-    - "in 2 hours", "in 30 minutes"
-    - "tomorrow 2 PM", "tomorrow at 2:30 PM"
-    
-    Returns Unix timestamp for today or tomorrow based on the time.
-    """
-    time_str = time_str.strip().lower()
-    now = datetime.now()
-    
-    # Handle relative time formats like "in X hours/minutes"
-    if time_str.startswith("in "):
-        relative_match = re.match(r"in (\d+) (hour|hours|minute|minutes)", time_str)
-        if relative_match:
-            amount = int(relative_match.group(1))
-            unit = relative_match.group(2)
-            
-            if unit.startswith("hour"):
-                target_time = now + timedelta(hours=amount)
-            else:  # minutes
-                target_time = now + timedelta(minutes=amount)
-            
-            return int(target_time.timestamp())
-    
-    # Handle tomorrow formats
-    is_tomorrow = False
-    if "tomorrow" in time_str:
-        is_tomorrow = True
-        time_str = re.sub(r"tomorrow\s*(at\s*)?", "", time_str).strip()
-    
-    # Parse various time formats
-    time_patterns = [
-        r"(\d{1,2}):(\d{2})\s*(am|pm)",  # 2:30 PM, 12:30 am
-        r"(\d{1,2})\s*(am|pm)",          # 2 PM, 12 am
-        r"(\d{1,2}):(\d{2}):(\d{2})",    # 14:30:00
-        r"(\d{1,2}):(\d{2})",            # 14:30, 2:30 (24-hour)
-    ]
-    
-    target_time = None
-    
-    for pattern in time_patterns:
-        match = re.match(pattern, time_str)
-        if match:
-            if "am" in time_str or "pm" in time_str:
-                # 12-hour format
-                hour = int(match.group(1))
-                minute = int(match.group(2)) if len(match.groups()) >= 2 and match.group(2) else 0
-                is_pm = "pm" in time_str
-                
-                # Convert to 24-hour format
-                if is_pm and hour != 12:
-                    hour += 12
-                elif not is_pm and hour == 12:
-                    hour = 0
-                    
-                target_time = time(hour, minute)
-            else:
-                # 24-hour format
-                hour = int(match.group(1))
-                minute = int(match.group(2)) if len(match.groups()) >= 2 and match.group(2) else 0
-                target_time = time(hour, minute)
-            break
-    
-    if not target_time:
-        raise ValueError(f"Unable to parse time format: {time_str}")
-    
-    # Create datetime for today or tomorrow
-    today = now.date()
-    if is_tomorrow:
-        target_date = today + timedelta(days=1)
-    else:
-        target_date = today
-        # If the time has already passed today, schedule for tomorrow
-        target_datetime = datetime.combine(target_date, target_time)
-        if target_datetime <= now:
-            target_date = today + timedelta(days=1)
-    
-    target_datetime = datetime.combine(target_date, target_time)
-    return int(target_datetime.timestamp())
-
-
 @router.post("/batch-calling", response_model=BatchCallResponse)
 async def batch_calling(
     agent_id: str = Form(...),
     csv_file: UploadFile = File(...),
     phone_column: str = Form("phone"),  # Default column name for phone numbers
     call_name: str = Form(...),  # Name for the batch calling job
-    scheduled_time_unix: Optional[int] = Form(None),  # Optional scheduled time (Unix timestamp)
-    scheduled_time: Optional[str] = Form(None),  # Optional human-readable time (e.g., "2 PM", "tomorrow 3:30 PM")
+    scheduled_time: Optional[str] = Form(None),  # Optional scheduled time (human-readable format)
+    scheduled_time_unix: Optional[int] = Form(None),  # Optional scheduled time (Unix timestamp) - for backward compatibility
     current_user: User = Depends(get_current_active_user)
 ):
     """
@@ -1081,28 +1110,21 @@ async def batch_calling(
         csv_file: CSV file containing phone numbers
         phone_column: Name of the column containing phone numbers (default: 'phone')
         call_name: Name for the batch calling job
-        scheduled_time_unix: Optional Unix timestamp for scheduling calls
-        scheduled_time: Optional human-readable time (e.g., "2 PM", "14:30", "tomorrow 3:30 PM", "in 2 hours")
+        scheduled_time: Optional human-readable scheduled time (e.g., "2025-12-21 2 PM", "2025-12-21 14:00", "Dec 21, 2025 2:00 PM")
+        scheduled_time_unix: Optional Unix timestamp for scheduling calls (for backward compatibility)
         
-    Note: If both scheduled_time and scheduled_time_unix are provided, scheduled_time_unix takes precedence.
-    If neither is provided, calls start immediately.
+    Supported date/time formats:
+        - "2025-12-21 2 PM" or "2025-12-21 14:00"
+        - "Dec 21, 2025 2:00 PM" 
+        - "December 21, 2025 14:00"
+        - "2025/12/21 2:00 PM"
+        - "21-12-2025 14:00"
+        - "2025-12-21T14:00:00" (ISO format)
         
     Returns:
         BatchCallResponse with batch job details
     """
     try:
-        # Handle scheduling - prioritize scheduled_time_unix, then parse scheduled_time
-        final_scheduled_time_unix = None
-        if scheduled_time_unix:
-            final_scheduled_time_unix = scheduled_time_unix
-        elif scheduled_time:
-            try:
-                final_scheduled_time_unix = parse_human_time_to_unix(scheduled_time)
-            except ValueError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid time format: {str(e)}. Supported formats: '2 PM', '14:30', 'tomorrow 3:30 PM', 'in 2 hours'"
-                )
         # Validate CSV file type
         if not csv_file.filename.endswith('.csv'):
             raise HTTPException(
@@ -1190,6 +1212,28 @@ async def batch_calling(
         # Prepare recipients for ElevenLabs batch calling API
         recipients = [{"phone_number": phone} for phone in phone_numbers]
         
+        # Handle scheduled time - prioritize human-readable format over Unix timestamp
+        final_scheduled_time_unix = None
+        
+        if scheduled_time:
+            # Parse human-readable datetime
+            try:
+                # Try advanced parser first, fallback to simple parser
+                try:
+                    final_scheduled_time_unix = parse_human_datetime(scheduled_time)
+                except (ImportError, NameError):
+                    # Use simple parser if dateutil/pytz not available
+                    final_scheduled_time_unix = parse_human_datetime_simple(scheduled_time)
+                print(f"Parsed scheduled time '{scheduled_time}' to Unix timestamp: {final_scheduled_time_unix}")
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(e)
+                )
+        elif scheduled_time_unix:
+            # Use provided Unix timestamp (backward compatibility)
+            final_scheduled_time_unix = scheduled_time_unix
+        
         # Prepare the batch calling payload
         batch_payload = {
             "call_name": call_name,
@@ -1197,7 +1241,6 @@ async def batch_calling(
             "agent_phone_number_id": phone_number_id,
             "recipients": recipients
         }
-        
         
         # Add scheduled time if provided
         if final_scheduled_time_unix:
@@ -1249,7 +1292,6 @@ async def batch_calling(
         # Format response
         scheduled_time_str = None
         if final_scheduled_time_unix:
-            from datetime import datetime
             scheduled_time_str = datetime.fromtimestamp(final_scheduled_time_unix).isoformat()
         
         return BatchCallResponse(
