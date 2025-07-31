@@ -13,6 +13,8 @@ from fastapi import Form, File, UploadFile
 from twilio.rest import Client
 from database import get_db
 from models import Agent, User
+from datetime import datetime, time, timedelta
+import re
 from auth import get_current_active_user
 
 router = APIRouter(
@@ -975,6 +977,92 @@ class BatchCallResponse(BaseModel):
     recipients: List[BatchCallRecipient]
 
 
+def parse_human_time_to_unix(time_str: str) -> int:
+    """
+    Parse human-readable time formats to Unix timestamp.
+    
+    Supported formats:
+    - "2 PM", "2:30 PM", "14:30", "2:30 pm"
+    - "2pm", "2:30pm", "14:30:00"
+    - "in 2 hours", "in 30 minutes"
+    - "tomorrow 2 PM", "tomorrow at 2:30 PM"
+    
+    Returns Unix timestamp for today or tomorrow based on the time.
+    """
+    time_str = time_str.strip().lower()
+    now = datetime.now()
+    
+    # Handle relative time formats like "in X hours/minutes"
+    if time_str.startswith("in "):
+        relative_match = re.match(r"in (\d+) (hour|hours|minute|minutes)", time_str)
+        if relative_match:
+            amount = int(relative_match.group(1))
+            unit = relative_match.group(2)
+            
+            if unit.startswith("hour"):
+                target_time = now + timedelta(hours=amount)
+            else:  # minutes
+                target_time = now + timedelta(minutes=amount)
+            
+            return int(target_time.timestamp())
+    
+    # Handle tomorrow formats
+    is_tomorrow = False
+    if "tomorrow" in time_str:
+        is_tomorrow = True
+        time_str = re.sub(r"tomorrow\s*(at\s*)?", "", time_str).strip()
+    
+    # Parse various time formats
+    time_patterns = [
+        r"(\d{1,2}):(\d{2})\s*(am|pm)",  # 2:30 PM, 12:30 am
+        r"(\d{1,2})\s*(am|pm)",          # 2 PM, 12 am
+        r"(\d{1,2}):(\d{2}):(\d{2})",    # 14:30:00
+        r"(\d{1,2}):(\d{2})",            # 14:30, 2:30 (24-hour)
+    ]
+    
+    target_time = None
+    
+    for pattern in time_patterns:
+        match = re.match(pattern, time_str)
+        if match:
+            if "am" in time_str or "pm" in time_str:
+                # 12-hour format
+                hour = int(match.group(1))
+                minute = int(match.group(2)) if len(match.groups()) >= 2 and match.group(2) else 0
+                is_pm = "pm" in time_str
+                
+                # Convert to 24-hour format
+                if is_pm and hour != 12:
+                    hour += 12
+                elif not is_pm and hour == 12:
+                    hour = 0
+                    
+                target_time = time(hour, minute)
+            else:
+                # 24-hour format
+                hour = int(match.group(1))
+                minute = int(match.group(2)) if len(match.groups()) >= 2 and match.group(2) else 0
+                target_time = time(hour, minute)
+            break
+    
+    if not target_time:
+        raise ValueError(f"Unable to parse time format: {time_str}")
+    
+    # Create datetime for today or tomorrow
+    today = now.date()
+    if is_tomorrow:
+        target_date = today + timedelta(days=1)
+    else:
+        target_date = today
+        # If the time has already passed today, schedule for tomorrow
+        target_datetime = datetime.combine(target_date, target_time)
+        if target_datetime <= now:
+            target_date = today + timedelta(days=1)
+    
+    target_datetime = datetime.combine(target_date, target_time)
+    return int(target_datetime.timestamp())
+
+
 @router.post("/batch-calling", response_model=BatchCallResponse)
 async def batch_calling(
     agent_id: str = Form(...),
@@ -982,6 +1070,7 @@ async def batch_calling(
     phone_column: str = Form("phone"),  # Default column name for phone numbers
     call_name: str = Form(...),  # Name for the batch calling job
     scheduled_time_unix: Optional[int] = Form(None),  # Optional scheduled time (Unix timestamp)
+    scheduled_time: Optional[str] = Form(None),  # Optional human-readable time (e.g., "2 PM", "tomorrow 3:30 PM")
     current_user: User = Depends(get_current_active_user)
 ):
     """
@@ -992,12 +1081,28 @@ async def batch_calling(
         csv_file: CSV file containing phone numbers
         phone_column: Name of the column containing phone numbers (default: 'phone')
         call_name: Name for the batch calling job
-        scheduled_time_unix: Optional Unix timestamp for scheduling calls (if not provided, calls start immediately)
+        scheduled_time_unix: Optional Unix timestamp for scheduling calls
+        scheduled_time: Optional human-readable time (e.g., "2 PM", "14:30", "tomorrow 3:30 PM", "in 2 hours")
+        
+    Note: If both scheduled_time and scheduled_time_unix are provided, scheduled_time_unix takes precedence.
+    If neither is provided, calls start immediately.
         
     Returns:
         BatchCallResponse with batch job details
     """
     try:
+        # Handle scheduling - prioritize scheduled_time_unix, then parse scheduled_time
+        final_scheduled_time_unix = None
+        if scheduled_time_unix:
+            final_scheduled_time_unix = scheduled_time_unix
+        elif scheduled_time:
+            try:
+                final_scheduled_time_unix = parse_human_time_to_unix(scheduled_time)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid time format: {str(e)}. Supported formats: '2 PM', '14:30', 'tomorrow 3:30 PM', 'in 2 hours'"
+                )
         # Validate CSV file type
         if not csv_file.filename.endswith('.csv'):
             raise HTTPException(
@@ -1095,8 +1200,8 @@ async def batch_calling(
         
         
         # Add scheduled time if provided
-        if scheduled_time_unix:
-            batch_payload["scheduled_time_unix"] = scheduled_time_unix
+        if final_scheduled_time_unix:
+            batch_payload["scheduled_time_unix"] = final_scheduled_time_unix
         else:
             batch_payload["scheduled_time_unix"] = 42
         print(batch_payload)
@@ -1136,16 +1241,16 @@ async def batch_calling(
                 )
             """, (
                 user_id, agent_id, batch_job_id, call_name, len(phone_numbers),
-                scheduled_time_unix, "submitted"
+                final_scheduled_time_unix, "submitted"
             ))
             conn.commit()
             print(f"Batch calling record saved to database")
         
         # Format response
         scheduled_time_str = None
-        if scheduled_time_unix:
+        if final_scheduled_time_unix:
             from datetime import datetime
-            scheduled_time_str = datetime.fromtimestamp(scheduled_time_unix).isoformat()
+            scheduled_time_str = datetime.fromtimestamp(final_scheduled_time_unix).isoformat()
         
         return BatchCallResponse(
             status="success",
@@ -1168,47 +1273,76 @@ async def batch_calling(
         )
 
 
-@router.get("/batch-calling-status/{call_name}")
+@router.get("/batch-calling-status/{call_name_or_batch_id}")
 async def get_batch_calling_status(
-    call_name: str,
+    call_name_or_batch_id: str,
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Get the status of a batch calling job from ElevenLabs using call_name.
+    Get the status of a batch calling job from ElevenLabs.
+    Can accept either a call_name or batch_job_id.
+    If call_name is provided, it will look up the batch_job_id from database.
     
     Args:
-        call_name: The name of the batch calling job
+        call_name_or_batch_id: Either the call_name or batch_job_id of the batch calling job
         
     Returns:
         Batch calling job status and details
     """
     try:
-        # Get batch_job_id from database using call_name
+        batch_job_id = None
+        call_name = None
+        
+        # Check if user has permission to view this batch job
         with get_db() as conn:
             cursor = conn.cursor()
             
-            # Check if user is super admin or owns the batch job
+            # First try to find by call_name
             if current_user.role.lower() == "super admin":
                 cursor.execute("""
-                    SELECT id, batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
+                    SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
                     FROM batch_calls 
                     WHERE call_name = %s
-                """, (call_name,))
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (call_name_or_batch_id,))
             else:
                 cursor.execute("""
-                    SELECT id, batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
+                    SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
                     FROM batch_calls 
                     WHERE call_name = %s AND user_id = %s
-                """, (call_name, current_user.id))
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (call_name_or_batch_id, current_user.id))
             
             batch_record = cursor.fetchone()
+            
+            # If not found by call_name, try to find by batch_job_id
+            if not batch_record:
+                if current_user.role.lower() == "super admin":
+                    cursor.execute("""
+                        SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
+                        FROM batch_calls 
+                        WHERE batch_job_id = %s
+                    """, (call_name_or_batch_id,))
+                else:
+                    cursor.execute("""
+                        SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
+                        FROM batch_calls 
+                        WHERE batch_job_id = %s AND user_id = %s
+                    """, (call_name_or_batch_id, current_user.id))
+                
+                batch_record = cursor.fetchone()
+            
             if not batch_record:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Batch calling job not found or you don't have permission to view it"
                 )
             
-            batch_job_id = batch_record[1]
+            # Extract values from the record
+            batch_job_id = batch_record[0]
+            call_name = batch_record[1]
         
         # Get batch calling status from ElevenLabs
         status_response = requests.get(
@@ -1227,16 +1361,28 @@ async def get_batch_calling_status(
         
         batch_status = status_response.json()
         
+        # Update local status if it's different from ElevenLabs
+        elevenlabs_status = batch_status.get("status", "unknown")
+        if elevenlabs_status != batch_record[4]:  # batch_record[4] is the local status
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE batch_calls 
+                    SET status = %s, updated_at = NOW()
+                    WHERE batch_job_id = %s
+                """, (elevenlabs_status, batch_job_id))
+                conn.commit()
+        
         return {
             "status": "success",
-            "call_name": call_name,
             "batch_job_id": batch_job_id,
+            "call_name": call_name,
             "local_record": {
-                "call_name": batch_record[2],
-                "total_numbers": batch_record[3],
-                "scheduled_time_unix": batch_record[4],
-                "local_status": batch_record[5],
-                "created_at": batch_record[6].isoformat() if batch_record[6] else None
+                "call_name": batch_record[1],
+                "total_numbers": batch_record[2],
+                "scheduled_time_unix": batch_record[3],
+                "local_status": elevenlabs_status,  # Use updated status
+                "created_at": batch_record[5].isoformat() if batch_record[5] else None
             },
             "elevenlabs_status": batch_status
         }
@@ -1247,107 +1393,6 @@ async def get_batch_calling_status(
         raise HTTPException(
             status_code=500,
             detail=f"Error getting batch calling status: {str(e)}"
-        )
-
-
-@router.post("/batch-calling-cancel/{call_name}")
-async def cancel_batch_calling(
-    call_name: str,
-    current_user: User = Depends(get_current_active_user)
-):
-    """
-    Cancel a batch calling job using call_name.
-    
-    Args:
-        call_name: The name of the batch calling job to cancel
-        
-    Returns:
-        Cancellation status and details
-    """
-    try:
-        # Get batch_job_id from database using call_name
-        with get_db() as conn:
-            cursor = conn.cursor()
-            
-            # Check if user is super admin or owns the batch job
-            if current_user.role.lower() == "super admin":
-                cursor.execute("""
-                    SELECT id, batch_job_id, call_name, total_numbers, status, created_at, user_id
-                    FROM batch_calls 
-                    WHERE call_name = %s
-                """, (call_name,))
-            else:
-                cursor.execute("""
-                    SELECT id, batch_job_id, call_name, total_numbers, status, created_at, user_id
-                    FROM batch_calls 
-                    WHERE call_name = %s AND user_id = %s
-                """, (call_name, current_user.id))
-            
-            batch_record = cursor.fetchone()
-            if not batch_record:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Batch calling job not found or you don't have permission to cancel it"
-                )
-            
-            batch_job_id = batch_record[1]
-            current_status = batch_record[4]
-        
-        # Check if the job can be cancelled
-        if current_status in ["cancelled", "completed", "failed"]:
-            return {
-                "status": "info",
-                "message": f"Batch calling job '{call_name}' is already {current_status} and cannot be cancelled",
-                "call_name": call_name,
-                "batch_job_id": batch_job_id,
-                "current_status": current_status
-            }
-        
-        # Cancel batch calling job via ElevenLabs API
-        cancel_response = requests.post(
-            f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}/cancel",
-            headers={
-                "xi-api-key": ELEVENLABS_API_KEY
-            },
-            timeout=30
-        )
-        
-        if cancel_response.status_code != 200:
-            raise HTTPException(
-                status_code=cancel_response.status_code,
-                detail=f"Failed to cancel batch calling job: {cancel_response.text}"
-            )
-        
-        cancel_result = cancel_response.json()
-        
-        # Update local database status
-        with get_db() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                UPDATE batch_calls 
-                SET status = %s, updated_at = NOW()
-                WHERE batch_job_id = %s
-            """, ("cancelled", batch_job_id))
-            conn.commit()
-            
-            print(f"✅ Batch calling job {call_name} cancelled and database updated")
-        
-        return {
-            "status": "success",
-            "message": f"Batch calling job '{call_name}' has been cancelled successfully",
-            "call_name": call_name,
-            "batch_job_id": batch_job_id,
-            "cancelled_by": current_user.name,
-            "elevenlabs_response": cancel_result
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error cancelling batch calling job: {str(e)}"
         )
 
 
@@ -1414,6 +1459,212 @@ async def list_batch_calling_jobs(
         raise HTTPException(
             status_code=500,
             detail=f"Error listing batch calling jobs: {str(e)}"
+        )
+
+
+@router.post("/cancel-batch-calling")
+async def cancel_batch_calling(
+    call_name: str = Form(...),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Cancel a batch calling job using the call_name.
+    Looks up the batch_job_id from database and cancels the job via ElevenLabs API.
+    
+    Args:
+        call_name: The name of the batch calling job to cancel
+        
+    Returns:
+        Cancellation status and details
+    """
+    try:
+        # Get batch job details from database using call_name
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the batch job
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT batch_job_id, agent_id, total_numbers, status, created_at
+                    FROM batch_calls 
+                    WHERE call_name = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (call_name,))
+            else:
+                cursor.execute("""
+                    SELECT batch_job_id, agent_id, total_numbers, status, created_at
+                    FROM batch_calls 
+                    WHERE call_name = %s AND user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (call_name, current_user.id))
+            
+            batch_record = cursor.fetchone()
+            if not batch_record:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Batch calling job with name '{call_name}' not found or you don't have permission to cancel it"
+                )
+            
+            batch_job_id, agent_id, total_numbers, current_status, created_at = batch_record
+        
+        # Check if job can be cancelled
+        if current_status in ["completed", "cancelled", "failed"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot cancel batch job. Current status: {current_status}"
+            )
+        
+        # Cancel batch calling job via ElevenLabs API
+        cancel_response = requests.post(
+            f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}/cancel",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY
+            },
+            timeout=30
+        )
+        
+        if cancel_response.status_code not in [200, 204]:
+            raise HTTPException(
+                status_code=cancel_response.status_code,
+                detail=f"Failed to cancel batch calling job: {cancel_response.text}"
+            )
+        
+        # Update status in database
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE batch_calls 
+                SET status = 'cancelled', updated_at = NOW()
+                WHERE batch_job_id = %s
+            """, (batch_job_id,))
+            conn.commit()
+        
+        cancel_result = cancel_response.json() if cancel_response.text else {}
+        
+        return {
+            "status": "success",
+            "message": f"Batch calling job '{call_name}' cancelled successfully",
+            "call_name": call_name,
+            "batch_job_id": batch_job_id,
+            "agent_id": agent_id,
+            "total_numbers": total_numbers,
+            "previous_status": current_status,
+            "current_status": "cancelled",
+            "cancelled_by": current_user.name,
+            "elevenlabs_response": cancel_result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error cancelling batch calling job: {str(e)}"
+        )
+
+
+@router.get("/batch-calling-status-by-name/{call_name}")
+async def get_batch_calling_status_by_name(
+    call_name: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Get the status of a batch calling job using the call_name.
+    Looks up the batch_job_id from database and gets status from ElevenLabs API.
+    
+    Args:
+        call_name: The name of the batch calling job
+        
+    Returns:
+        Batch calling job status and details
+    """
+    try:
+        # Get batch job details from database using call_name
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the batch job
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT batch_job_id, agent_id, total_numbers, scheduled_time_unix, 
+                           status, created_at, updated_at
+                    FROM batch_calls 
+                    WHERE call_name = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (call_name,))
+            else:
+                cursor.execute("""
+                    SELECT batch_job_id, agent_id, total_numbers, scheduled_time_unix, 
+                           status, created_at, updated_at
+                    FROM batch_calls 
+                    WHERE call_name = %s AND user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (call_name, current_user.id))
+            
+            batch_record = cursor.fetchone()
+            if not batch_record:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Batch calling job with name '{call_name}' not found or you don't have permission to view it"
+                )
+            
+            batch_job_id, agent_id, total_numbers, scheduled_time_unix, local_status, created_at, updated_at = batch_record
+        
+        # Get batch calling status from ElevenLabs
+        status_response = requests.get(
+            f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY
+            },
+            timeout=30
+        )
+        
+        if status_response.status_code != 200:
+            raise HTTPException(
+                status_code=status_response.status_code,
+                detail=f"Failed to get batch calling status from ElevenLabs: {status_response.text}"
+            )
+        
+        batch_status = status_response.json()
+        
+        # Update local status if it's different from ElevenLabs
+        elevenlabs_status = batch_status.get("status", "unknown")
+        if elevenlabs_status != local_status:
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE batch_calls 
+                    SET status = %s, updated_at = NOW()
+                    WHERE batch_job_id = %s
+                """, (elevenlabs_status, batch_job_id))
+                conn.commit()
+                local_status = elevenlabs_status
+        
+        return {
+            "status": "success",
+            "call_name": call_name,
+            "batch_job_id": batch_job_id,
+            "agent_id": agent_id,
+            "local_record": {
+                "total_numbers": total_numbers,
+                "scheduled_time_unix": scheduled_time_unix,
+                "local_status": local_status,
+                "created_at": created_at.isoformat() if created_at else None,
+                "updated_at": updated_at.isoformat() if updated_at else None
+            },
+            "elevenlabs_status": batch_status
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting batch calling status: {str(e)}"
         )
         
 
