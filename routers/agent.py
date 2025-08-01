@@ -7,6 +7,7 @@ import base64
 import requests
 import csv
 import io
+import pandas as pd
 from datetime import datetime
 from dateutil import parser as date_parser
 import pytz
@@ -1102,15 +1103,18 @@ async def batch_calling(
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Perform batch calling using ElevenLabs batch calling API with a CSV file containing phone numbers.
+    Perform batch calling using ElevenLabs batch calling API with a CSV or Excel file containing phone numbers.
     
     Args:
         agent_name: The name of the agent to use for calling
-        csv_file: CSV file containing phone numbers
+        csv_file: CSV (.csv) or Excel (.xlsx) file containing phone numbers
         phone_column: Name of the column containing phone numbers (default: 'phone')
         call_name: Name for the batch calling job
         scheduled_time: Optional human-readable scheduled time (e.g., "2025-12-21 2 PM", "2025-12-21 14:00", "Dec 21, 2025 2:00 PM")
-        scheduled_time_unix: Optional Unix timestamp for scheduling calls (for backward compatibility)
+        
+    Supported file formats:
+        - CSV (.csv)
+        - Excel (.xlsx)
         
     Supported date/time formats:
         - "2025-12-21 2 PM" or "2025-12-21 14:00"
@@ -1124,18 +1128,33 @@ async def batch_calling(
         BatchCallResponse with batch job details
     """
     try:
-        # Validate CSV file type
-        if not csv_file.filename.endswith('.csv'):
+        # Validate file type - allow both CSV and Excel files
+        allowed_extensions = ['.csv', '.xlsx']
+        file_extension = None
+        for ext in allowed_extensions:
+            if csv_file.filename.endswith(ext):
+                file_extension = ext
+                break
+        
+        if not file_extension:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only CSV files are allowed"
+                detail="Only CSV and Excel (.xlsx) files are allowed"
             )
         
-        # Validate CSV content type
-        if csv_file.content_type not in ['text/csv', 'application/csv', 'application/vnd.ms-excel']:
+        # Validate content type
+        if file_extension == '.csv':
+            allowed_content_types = ['text/csv', 'application/csv', 'application/vnd.ms-excel']
+        else:  # .xlsx
+            allowed_content_types = [
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'application/vnd.ms-excel'
+            ]
+        
+        if csv_file.content_type not in allowed_content_types:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid content type. Expected CSV file. Received: {csv_file.content_type}"
+                detail=f"Invalid content type. Expected {file_extension} file. Received: {csv_file.content_type}"
             )
         
         # Get agent data from database to verify ownership and get phone number
@@ -1171,25 +1190,60 @@ async def batch_calling(
                 detail="Agent doesn't have a phone number configured"
             )
 
-        # Read and parse CSV file
-        csv_content = await csv_file.read()
-        csv_string = csv_content.decode('utf-8')
-        csv_reader = csv.DictReader(io.StringIO(csv_string))
+        # Read and parse file (CSV or Excel)
+        if file_extension == '.csv':
+            # Handle CSV files
+            csv_content = await csv_file.read()
+            csv_string = csv_content.decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(csv_string))
+            rows = list(csv_reader)
+        else:  # .xlsx
+            # Handle Excel files
+            try:
+                file_content = await csv_file.read()
+                
+                # Save temporarily to read with pandas
+                temp_file_path = f"temp_{csv_file.filename}"
+                with open(temp_file_path, "wb") as temp_file:
+                    temp_file.write(file_content)
+                
+                try:
+                    # Read Excel file
+                    df = pd.read_excel(temp_file_path)
+                    # Handle NaN values by replacing them with empty strings
+                    df = df.fillna('')
+                    # Convert to list of dictionaries (same format as CSV reader)
+                    rows = df.to_dict('records')
+                finally:
+                    # Clean up temporary file
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+            except ImportError:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Excel file support not available. Please install pandas and openpyxl."
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Error reading Excel file: {str(e)}"
+                )
         
-        # Extract phone numbers from CSV
+        # Extract phone numbers from rows
         phone_numbers = []
         row_count = 0
         
-        for row in csv_reader:
+        for row in rows:
             row_count += 1
             if phone_column not in row:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Column '{phone_column}' not found in CSV. Available columns: {list(row.keys())}"
+                    detail=f"Column '{phone_column}' not found in file. Available columns: {list(row.keys())}"
                 )
             
-            phone_number = row[phone_column].strip()
-            if phone_number:  # Only add non-empty phone numbers
+            # Convert to string first (important for Excel files where numbers might be integers)
+            phone_number = str(row[phone_column]).strip() if row[phone_column] is not None else ""
+            if phone_number and phone_number.lower() not in ['nan', 'none', '']:  # Only add non-empty phone numbers
                 # Basic phone number validation (remove spaces, dashes, etc.)
                 cleaned_phone = ''.join(filter(str.isdigit, phone_number))
                 if len(cleaned_phone) >= 10:  # Minimum valid phone number length
@@ -1203,7 +1257,7 @@ async def batch_calling(
         if not phone_numbers:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No valid phone numbers found in CSV file"
+                detail="No valid phone numbers found in the uploaded file"
             )
         
         print(f"Found {len(phone_numbers)} valid phone numbers for batch calling")
