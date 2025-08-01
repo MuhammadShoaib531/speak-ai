@@ -1099,7 +1099,6 @@ async def batch_calling(
     phone_column: str = Form("phone"),  # Default column name for phone numbers
     call_name: str = Form(...),  # Name for the batch calling job
     scheduled_time: Optional[str] = Form(None),  # Optional scheduled time (human-readable format)
-    scheduled_time_unix: Optional[int] = Form(None),  # Optional scheduled time (Unix timestamp) - for backward compatibility
     current_user: User = Depends(get_current_active_user)
 ):
     """
@@ -1211,7 +1210,8 @@ async def batch_calling(
         
         # Prepare recipients for ElevenLabs batch calling API
         recipients = [{"phone_number": phone} for phone in phone_numbers]
-        
+
+        scheduled_time_unix= 42
         # Handle scheduled time - prioritize human-readable format over Unix timestamp
         final_scheduled_time_unix = None
         
@@ -1315,119 +1315,179 @@ async def batch_calling(
         )
 
 
-@router.get("/batch-calling-status/{call_name_or_batch_id}")
+@router.get("/batch-calling-status")
 async def get_batch_calling_status(
-    call_name_or_batch_id: str,
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Get the status of a batch calling job from ElevenLabs.
-    Can accept either a call_name or batch_job_id.
-    If call_name is provided, it will look up the batch_job_id from database.
+    Get the status of all batch calling jobs for the current user from ElevenLabs API.
+    This endpoint fetches live status for ALL batch jobs belonging to the current user.
     
-    Args:
-        call_name_or_batch_id: Either the call_name or batch_job_id of the batch calling job
-        
     Returns:
-        Batch calling job status and details
+        Live status for all batch calling jobs from ElevenLabs API
     """
     try:
-        batch_job_id = None
-        call_name = None
-        
-        # Check if user has permission to view this batch job
+        # Get all batch job IDs for the current user
         with get_db() as conn:
             cursor = conn.cursor()
             
-            # First try to find by call_name
+            # Get all batch jobs for the current user (or all if super admin)
             if current_user.role.lower() == "super admin":
                 cursor.execute("""
-                    SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
-                    FROM batch_calls 
-                    WHERE call_name = %s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, (call_name_or_batch_id,))
+                    SELECT bc.batch_job_id, bc.call_name, bc.total_numbers, 
+                           bc.scheduled_time_unix, bc.status, bc.created_at, bc.agent_id,
+                           a.agent_name, u.name as user_name, u.email as user_email
+                    FROM batch_calls bc
+                    JOIN agents a ON bc.agent_id = a.agent_id
+                    JOIN users u ON bc.user_id = u.id
+                    ORDER BY bc.created_at DESC
+                """)
             else:
                 cursor.execute("""
-                    SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
-                    FROM batch_calls 
-                    WHERE call_name = %s AND user_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, (call_name_or_batch_id, current_user.id))
+                    SELECT bc.batch_job_id, bc.call_name, bc.total_numbers, 
+                           bc.scheduled_time_unix, bc.status, bc.created_at, bc.agent_id,
+                           a.agent_name, u.name as user_name, u.email as user_email
+                    FROM batch_calls bc
+                    JOIN agents a ON bc.agent_id = a.agent_id
+                    JOIN users u ON bc.user_id = u.id
+                    WHERE bc.user_id = %s
+                    ORDER BY bc.created_at DESC
+                """, (current_user.id,))
             
-            batch_record = cursor.fetchone()
+            batch_records = cursor.fetchall()
             
-            # If not found by call_name, try to find by batch_job_id
-            if not batch_record:
-                if current_user.role.lower() == "super admin":
-                    cursor.execute("""
-                        SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
-                        FROM batch_calls 
-                        WHERE batch_job_id = %s
-                    """, (call_name_or_batch_id,))
-                else:
-                    cursor.execute("""
-                        SELECT batch_job_id, call_name, total_numbers, scheduled_time_unix, status, created_at
-                        FROM batch_calls 
-                        WHERE batch_job_id = %s AND user_id = %s
-                    """, (call_name_or_batch_id, current_user.id))
-                
-                batch_record = cursor.fetchone()
+            if not batch_records:
+                return {
+                    "status": "success",
+                    "message": "No batch calling jobs found for this user",
+                    "user_email": current_user.email,
+                    "total_jobs": 0,
+                    "jobs": []
+                }
+        
+        # Fetch live status from ElevenLabs for each batch job
+        jobs_with_live_status = []
+        successful_updates = 0
+        failed_updates = 0
+        
+        for record in batch_records:
+            batch_job_id = record[0]
+            call_name = record[1]
+            total_numbers = record[2]
+            scheduled_time_unix = record[3]
+            local_status = record[4]
+            created_at = record[5]
+            agent_id = record[6]
+            agent_name = record[7]
+            user_name = record[8]
+            user_email = record[9]
             
-            if not batch_record:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Batch calling job not found or you don't have permission to view it"
+            try:
+                # Get live status from ElevenLabs
+                status_response = requests.get(
+                    f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}",
+                    headers={
+                        "xi-api-key": ELEVENLABS_API_KEY
+                    },
+                    timeout=30
                 )
+                
+                if status_response.status_code == 200:
+                    elevenlabs_status = status_response.json()
+                    live_status = elevenlabs_status.get("status", "unknown")
+                    
+                    # Update local database if status changed
+                    if live_status != local_status:
+                        with get_db() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                                UPDATE batch_calls 
+                                SET status = %s, updated_at = NOW()
+                                WHERE batch_job_id = %s
+                            """, (live_status, batch_job_id))
+                            conn.commit()
+                    
+                    job_data = {
+                        "batch_job_id": batch_job_id,
+                        "call_name": call_name,
+                        "agent_id": agent_id,
+                        "agent_name": agent_name,
+                        "user_name": user_name,
+                        "user_email": user_email,
+                        "local_record": {
+                            "total_numbers": total_numbers,
+                            "scheduled_time_unix": scheduled_time_unix,
+                            "previous_local_status": local_status,
+                            "updated_status": live_status,
+                            "created_at": created_at.isoformat() if created_at else None
+                        },
+                        "elevenlabs_live_status": elevenlabs_status,
+                        "status_fetch": "success"
+                    }
+                    successful_updates += 1
+                    
+                else:
+                    # If ElevenLabs API fails, use local data
+                    job_data = {
+                        "batch_job_id": batch_job_id,
+                        "call_name": call_name,
+                        "agent_id": agent_id,
+                        "agent_name": agent_name,
+                        "user_name": user_name,
+                        "user_email": user_email,
+                        "local_record": {
+                            "total_numbers": total_numbers,
+                            "scheduled_time_unix": scheduled_time_unix,
+                            "local_status": local_status,
+                            "created_at": created_at.isoformat() if created_at else None
+                        },
+                        "elevenlabs_live_status": None,
+                        "status_fetch": "failed",
+                        "error": f"ElevenLabs API error: {status_response.status_code}"
+                    }
+                    failed_updates += 1
+                    
+            except Exception as e:
+                # Handle any request errors
+                job_data = {
+                    "batch_job_id": batch_job_id,
+                    "call_name": call_name,
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "user_name": user_name,
+                    "user_email": user_email,
+                    "local_record": {
+                        "total_numbers": total_numbers,
+                        "scheduled_time_unix": scheduled_time_unix,
+                        "local_status": local_status,
+                        "created_at": created_at.isoformat() if created_at else None
+                    },
+                    "elevenlabs_live_status": None,
+                    "status_fetch": "error",
+                    "error": str(e)
+                }
+                failed_updates += 1
             
-            # Extract values from the record
-            batch_job_id = batch_record[0]
-            call_name = batch_record[1]
-        
-        # Get batch calling status from ElevenLabs
-        status_response = requests.get(
-            f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}",
-            headers={
-                "xi-api-key": ELEVENLABS_API_KEY
-            },
-            timeout=30
-        )
-        
-        if status_response.status_code != 200:
-            raise HTTPException(
-                status_code=status_response.status_code,
-                detail=f"Failed to get batch calling status: {status_response.text}"
-            )
-        
-        batch_status = status_response.json()
-        
-        # Update local status if it's different from ElevenLabs
-        elevenlabs_status = batch_status.get("status", "unknown")
-        if elevenlabs_status != batch_record[4]:  # batch_record[4] is the local status
-            with get_db() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE batch_calls 
-                    SET status = %s, updated_at = NOW()
-                    WHERE batch_job_id = %s
-                """, (elevenlabs_status, batch_job_id))
-                conn.commit()
+            jobs_with_live_status.append(job_data)
         
         return {
             "status": "success",
-            "batch_job_id": batch_job_id,
-            "call_name": call_name,
-            "local_record": {
-                "call_name": batch_record[1],
-                "total_numbers": batch_record[2],
-                "scheduled_time_unix": batch_record[3],
-                "local_status": elevenlabs_status,  # Use updated status
-                "created_at": batch_record[5].isoformat() if batch_record[5] else None
-            },
-            "elevenlabs_status": batch_status
+            "message": f"Retrieved live status for {len(batch_records)} batch calling jobs",
+            "user_email": current_user.email,
+            "user_role": current_user.role,
+            "total_jobs": len(batch_records),
+            "successful_status_updates": successful_updates,
+            "failed_status_updates": failed_updates,
+            "jobs": jobs_with_live_status
         }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting batch calling status: {str(e)}"
+        )
         
     except HTTPException:
         raise
@@ -1604,6 +1664,158 @@ async def cancel_batch_calling(
         raise HTTPException(
             status_code=500,
             detail=f"Error cancelling batch calling job: {str(e)}"
+        )
+
+
+@router.post("/retry-batch-calling")
+async def retry_batch_calling(
+    call_name: str = Form(...),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Retry a batch calling job using the call_name.
+    Looks up the batch_job_id from database and retries the job via ElevenLabs API.
+    Checks live status from ElevenLabs before attempting retry.
+    
+    Args:
+        call_name: The name of the batch calling job to retry
+        
+    Returns:
+        Retry status and details
+    """
+    try:
+        # Get batch job details from database using call_name
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user is super admin or owns the batch job
+            if current_user.role.lower() == "super admin":
+                cursor.execute("""
+                    SELECT bc.batch_job_id, bc.agent_id, bc.total_numbers, bc.status, a.agent_name
+                    FROM batch_calls bc
+                    JOIN agents a ON bc.agent_id = a.agent_id
+                    WHERE bc.call_name = %s
+                    ORDER BY bc.created_at DESC
+                    LIMIT 1
+                """, (call_name,))
+            else:
+                cursor.execute("""
+                    SELECT bc.batch_job_id, bc.agent_id, bc.total_numbers, bc.status, a.agent_name
+                    FROM batch_calls bc
+                    JOIN agents a ON bc.agent_id = a.agent_id
+                    WHERE bc.call_name = %s AND bc.user_id = %s
+                    ORDER BY bc.created_at DESC
+                    LIMIT 1
+                """, (call_name, current_user.id))
+            
+            batch_record = cursor.fetchone()
+            
+            if not batch_record:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Batch calling job not found or you don't have permission to retry it"
+                )
+            
+            batch_job_id, agent_id, total_numbers, local_status, agent_name = batch_record
+        
+        print(f"Checking live status for batch job: {batch_job_id}")
+        
+        # Get live status from ElevenLabs API first
+        try:
+            status_response = requests.get(
+                f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}",
+                headers={
+                    "xi-api-key": ELEVENLABS_API_KEY
+                },
+                timeout=30
+            )
+            
+            if status_response.status_code != 200:
+                raise HTTPException(
+                    status_code=status_response.status_code,
+                    detail=f"Failed to get current status from ElevenLabs: {status_response.text}"
+                )
+            
+            elevenlabs_status_data = status_response.json()
+            live_status = elevenlabs_status_data.get("status", "unknown")
+            
+            print(f"Live status from ElevenLabs: {live_status}")
+            
+            # Update local database with live status
+            if live_status != local_status:
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE batch_calls 
+                        SET status = %s, updated_at = NOW()
+                        WHERE batch_job_id = %s
+                    """, (live_status, batch_job_id))
+                    conn.commit()
+                    print(f"Updated local status from '{local_status}' to '{live_status}'")
+            
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch live status from ElevenLabs: {str(e)}"
+            )
+        
+        # Check if job can be retried based on LIVE status from ElevenLabs
+        if live_status in ["in_progress", "pending", "submitted", "retrying"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot retry job with current ElevenLabs status '{live_status}'. Job must be completed, failed, or cancelled to retry."
+            )
+        
+        print(f"Retrying batch calling job: {batch_job_id} (current status: {live_status})")
+        
+        # Retry batch calling job via ElevenLabs API
+        retry_response = requests.post(
+            f"https://api.elevenlabs.io/v1/convai/batch-calling/{batch_job_id}/retry",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY
+            },
+            timeout=30
+        )
+        
+        if retry_response.status_code not in [200, 201]:
+            raise HTTPException(
+                status_code=retry_response.status_code,
+                detail=f"Failed to retry batch calling job: {retry_response.text}"
+            )
+        
+        # Update status in database to reflect retry
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE batch_calls 
+                SET status = %s, updated_at = NOW()
+                WHERE batch_job_id = %s
+            """, ("retrying", batch_job_id))
+            conn.commit()
+        
+        retry_result = retry_response.json() if retry_response.text else {}
+        
+        return {
+            "status": "success",
+            "message": f"Batch calling job '{call_name}' retry initiated successfully",
+            "call_name": call_name,
+            "batch_job_id": batch_job_id,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "total_numbers": total_numbers,
+            "previous_status": live_status,  # Use live status instead of local
+            "current_status": "retrying",
+            "retried_by": current_user.name,
+            "elevenlabs_live_status": elevenlabs_status_data,
+            "elevenlabs_response": retry_result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrying batch calling job: {str(e)}"
         )
 
 
