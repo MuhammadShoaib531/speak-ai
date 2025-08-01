@@ -1094,7 +1094,7 @@ class BatchCallResponse(BaseModel):
 
 @router.post("/batch-calling", response_model=BatchCallResponse)
 async def batch_calling(
-    agent_id: str = Form(...),
+    agent_name: str = Form(...),
     csv_file: UploadFile = File(...),
     phone_column: str = Form("phone"),  # Default column name for phone numbers
     call_name: str = Form(...),  # Name for the batch calling job
@@ -1105,7 +1105,7 @@ async def batch_calling(
     Perform batch calling using ElevenLabs batch calling API with a CSV file containing phone numbers.
     
     Args:
-        agent_id: The ID of the agent to use for calling
+        agent_name: The name of the agent to use for calling
         csv_file: CSV file containing phone numbers
         phone_column: Name of the column containing phone numbers (default: 'phone')
         call_name: Name for the batch calling job
@@ -1145,16 +1145,16 @@ async def batch_calling(
             # Check if user is super admin or owns the agent
             if current_user.role.lower() == "super admin":
                 cursor.execute("""
-                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    SELECT agent_id, agent_name, phone_number_id, twilio_number, user_id
                     FROM agents 
-                    WHERE agent_id = %s
-                """, (agent_id,))
+                    WHERE agent_name = %s
+                """, (agent_name,))
             else:
                 cursor.execute("""
-                    SELECT agent_name, phone_number_id, twilio_number, user_id
+                    SELECT agent_id, agent_name, phone_number_id, twilio_number, user_id
                     FROM agents 
-                    WHERE agent_id = %s AND user_id = %s
-                """, (agent_id, current_user.id))
+                    WHERE agent_name = %s AND user_id = %s
+                """, (agent_name, current_user.id))
             
             agent_data = cursor.fetchone()
             if not agent_data:
@@ -1163,7 +1163,7 @@ async def batch_calling(
                     detail="Agent not found or you don't have permission to use it"
                 )
             
-            agent_name, phone_number_id, twilio_number, user_id = agent_data
+            agent_id, agent_name, phone_number_id, twilio_number, user_id = agent_data
 
         if not phone_number_id:
             raise HTTPException(
